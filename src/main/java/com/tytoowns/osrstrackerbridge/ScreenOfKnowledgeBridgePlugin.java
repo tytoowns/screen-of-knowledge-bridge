@@ -176,12 +176,8 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     @Inject private ItemManager itemManager;
     @Inject private ScheduledExecutorService executor;
 
-    private final OkHttpClient http = new OkHttpClient.Builder()
-        .callTimeout(Duration.ofSeconds(3))
-        .connectTimeout(Duration.ofSeconds(2))
-        .readTimeout(Duration.ofSeconds(3))
-        .writeTimeout(Duration.ofSeconds(3))
-        .build();
+    @Inject
+    private OkHttpClient http;
 
     // --------------------
     // State caches (skills/bank)

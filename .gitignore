@@ -8,3 +8,8 @@ nbactions.xml
 nb-configuration.xml
 nbproject/credentials.properties
 credentials.properties
+
+# Local dev helpers / secrets
+run-dev-char.sh
+credentials.properties
+*.properties.local

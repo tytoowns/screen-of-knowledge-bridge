@@ -24,6 +24,13 @@ public final class PushPayload
     // Bank total (gp)
     public Long bankTotal;
 
+    // Heartbeat
+    public Boolean heartbeat;
+
+    // Explicit config update
+    public String configPlayerName;
+    public String hiscoreCategory;
+
     // Toast/test
     public String toast;
     public Integer toastMs;
@@ -64,6 +71,21 @@ public final class PushPayload
     {
         PushPayload p = base(player, seq, "bank_update");
         p.bankTotal = bankTotal;
+        return p;
+    }
+
+    public static PushPayload heartbeat(String player, long seq)
+    {
+        PushPayload p = base(player, seq, "heartbeat");
+        p.heartbeat = Boolean.TRUE;
+        return p;
+    }
+
+    public static PushPayload configUpdate(String player, long seq, String configPlayerName, String hiscoreCategory)
+    {
+        PushPayload p = base(player, seq, "config_update");
+        p.configPlayerName = configPlayerName;
+        p.hiscoreCategory = hiscoreCategory;
         return p;
     }
 

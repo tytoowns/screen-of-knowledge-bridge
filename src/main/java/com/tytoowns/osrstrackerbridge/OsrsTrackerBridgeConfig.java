@@ -55,12 +55,118 @@ public interface OsrsTrackerBridgeConfig extends Config
         return true;
     }
 
+    @ConfigSection(
+        name = "Device Config Sync",
+        description = "Current resolved player/category plus manual overrides for the device",
+        position = 4
+    )
+    String deviceConfigSection = "deviceConfigSection";
+
+    enum HiscoreCategoryChoice
+    {
+        AUTO("AUTO"),
+        NORMAL("hiscore_oldschool"),
+        IRONMAN("hiscore_oldschool_ironman"),
+        HARDCORE_IRONMAN("hiscore_oldschool_hardcore_ironman"),
+        ULTIMATE_IRONMAN("hiscore_oldschool_ultimate"),
+        DEADMAN("hiscore_oldschool_deadman"),
+        SEASONAL("hiscore_oldschool_seasonal"),
+        TOURNAMENT("hiscore_oldschool_tournament"),
+        FRESH_START("hiscore_oldschool_fresh_start");
+
+        private final String endpoint;
+
+        HiscoreCategoryChoice(String endpoint)
+        {
+            this.endpoint = endpoint;
+        }
+
+        public String endpoint()
+        {
+            return endpoint;
+        }
+    }
+
+    @ConfigItem(
+        keyName = "currentPlayerDisplay",
+        name = "Current player",
+        description = "Status only. Updated by the plugin.",
+        section = deviceConfigSection,
+        position = 0,
+        hidden = true
+    )
+    default String currentPlayerDisplay()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "currentHiscoreCategoryDisplay",
+        name = "Current hiscore category",
+        description = "Status only. Updated by the plugin.",
+        section = deviceConfigSection,
+        position = 1,
+        hidden = true
+    )
+    default String currentHiscoreCategoryDisplay()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "playerOverride",
+        name = "Player override",
+        description = "Leave blank to use the currently logged-in player name.",
+        section = deviceConfigSection,
+        position = 2
+    )
+    default String playerOverride()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "hiscoreCategory",
+        name = "Hiscore category",
+        description = "AUTO uses current world/account state. Any other value overrides it.",
+        section = deviceConfigSection,
+        position = 3
+    )
+    default HiscoreCategoryChoice hiscoreCategory()
+    {
+        return HiscoreCategoryChoice.AUTO;
+    }
+
+    @ConfigItem(
+        keyName = "syncConfigNow",
+        name = "Push player/category now",
+        description = "Checks once to push the resolved player/category config immediately, then auto-resets.",
+        section = deviceConfigSection,
+        position = 4
+    )
+    default boolean syncConfigNow()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+    keyName = "setToLoggedInPlayerNow",
+    name = "Set to currently logged in player",
+    description = "Sets Player override to your currently logged-in account name, resets Hiscore category to AUTO, and pushes/applies it to the device. Auto-resets.",
+    section = deviceConfigSection,
+    position = 5
+    )
+    default boolean setToLoggedInPlayerNow()
+    {
+        return false;
+    }
+
     // “Button-like” toggles:
     @ConfigItem(
         keyName = "testPing",
         name = "Test connection (/ping)",
         description = "Toggle ON to call /ping once. It will auto-reset to OFF.",
-        position = 4
+        position = 5
     )
     default boolean testPing()
     {
@@ -71,7 +177,7 @@ public interface OsrsTrackerBridgeConfig extends Config
         keyName = "testPush",
         name = "Send test push (toast)",
         description = "Toggle ON to send a test toast to the ESP32 once. It will auto-reset to OFF.",
-        position = 5
+        position = 6
     )
     default boolean testPush()
     {

@@ -44,6 +44,10 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 
+import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
 
 
 
@@ -57,6 +61,9 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 {
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
     private volatile String cachedPlayerName = null;
+    private NavigationButton navButton;
+    private ScreenOfKnowledgeBridgePanel sidePanel;
+    @Inject private ClientToolbar clientToolbar;
 
     private static final String CONFIG_GROUP = "osrstrackerbridge";
     private static final String CONFIG_KEY_CURRENT_PLAYER_DISPLAY = "currentPlayerDisplay";
@@ -266,6 +273,19 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         cancelFutures();
         clearSenderState();
 
+        sidePanel = new ScreenOfKnowledgeBridgePanel(this);
+
+        BufferedImage icon = loadNavIcon();
+
+        navButton = NavigationButton.builder()
+            .tooltip("Screen Of Knowledge Bridge")
+            .icon(icon)
+            .priority(6)
+            .panel(sidePanel)
+            .build();
+
+        clientToolbar.addNavigation(navButton);
+
         // If plugin starts while already logged in, do the same “logged in” init path.
         if (client.getGameState() == GameState.LOGGED_IN)
         {
@@ -308,6 +328,15 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     @Override
     protected void shutDown()
     {
+
+        if (navButton != null)
+        {
+            clientToolbar.removeNavigation(navButton);
+            navButton = null;
+        }
+
+        sidePanel = null;
+
         cancelFutures();
         lastLevels.clear();
         clearSenderState();
@@ -344,6 +373,141 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
     }
 
+    private BufferedImage loadNavIcon()
+    {
+        try
+        {
+            java.io.InputStream in =
+                ScreenOfKnowledgeBridgePlugin.class.getResourceAsStream("sok_icon.png");
+
+            if (in == null)
+            {
+                log.warn("Side panel icon resource not found: sok_icon.png");
+                return new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+            }
+
+            BufferedImage image = ImageIO.read(in);
+            if (image != null)
+            {
+                return image;
+            }
+
+            log.warn("Side panel icon failed to decode: sok_icon.png");
+        }
+        catch (IOException | IllegalArgumentException ex)
+        {
+            log.warn("Failed to load side panel icon: {}", ex.toString());
+        }
+
+        return new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+    }
+
+    void uiPushResolvedConfigNow()
+    {
+        uiSetPanelStatus("Pushing player/category...");
+
+        clientThread.invokeLater(() ->
+        {
+            refreshIdentityDisplay();
+            pushConfigNowValidated();
+        });
+    }
+
+    void uiSetToLoggedInPlayerNow()
+    {
+        uiSetPanelStatus("Applying logged-in player...");
+
+        clientThread.invokeLater(() ->
+        {
+            String loggedIn = getPlayerName();
+            if (loggedIn == null || loggedIn.trim().isEmpty())
+            {
+                refreshIdentityDisplay();
+                uiSetPanelStatus("No logged-in player found.");
+                return;
+            }
+
+            configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PLAYER_OVERRIDE, loggedIn.trim());
+            configManager.setConfiguration(
+                CONFIG_GROUP,
+                CONFIG_KEY_HISCORE_CATEGORY,
+                OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO.name()
+            );
+
+            refreshIdentityDisplay();
+
+            if (sidePanel != null)
+            {
+                sidePanel.refreshFromPlugin();
+            }
+
+            pushConfigNowValidated();
+        });
+    }
+
+    void uiTestPing()
+    {
+        doPing();
+    }
+
+    void uiSendTestPush()
+    {
+        uiSetPanelStatus("Sending test push...");
+        sendTestToast();
+    }
+
+    void uiSendSelectedToastTest()
+    {
+        uiSetPanelStatus("Sending selected toast test...");
+        runToastTestPreset();
+    }
+
+    void uiSetPlayerOverride(String value)
+    {
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_PLAYER_OVERRIDE,
+            value == null ? "" : value.trim()
+        );
+
+        clientThread.invokeLater(this::refreshIdentityDisplay);
+    }
+
+    void uiSetHiscoreCategory(OsrsTrackerBridgeConfig.HiscoreCategoryChoice choice)
+    {
+        if (choice == null)
+        {
+            choice = OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO;
+        }
+
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_HISCORE_CATEGORY,
+            choice.name()
+        );
+
+        clientThread.invokeLater(this::refreshIdentityDisplay);
+    }
+
+    String uiGetPlayerOverride()
+    {
+        String value = config.playerOverride();
+        return value == null ? "" : value;
+    }
+
+    OsrsTrackerBridgeConfig.HiscoreCategoryChoice uiGetHiscoreCategoryChoice()
+    {
+        OsrsTrackerBridgeConfig.HiscoreCategoryChoice choice = config.hiscoreCategory();
+        return choice == null ? OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO : choice;
+    }
+
+    void uiSetPanelStatus(String text)
+    {
+        if (sidePanel != null)
+        {
+            sidePanel.setStatusText(text);
+        }
+    }
 
     // ---- config toggles ----
     @Subscribe
@@ -363,17 +527,17 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 
         if ("testPing".equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            doPing();
+            uiTestPing();
             configManager.setConfiguration("osrstrackerbridge", "testPing", false);
         }
         else if ("testPush".equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            sendTestToast();
+            uiSendTestPush();
             configManager.setConfiguration("osrstrackerbridge", "testPush", false);
         }
         else if ("toastTestSend".equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            runToastTestPreset();
+            uiSendSelectedToastTest();
             configManager.setConfiguration("osrstrackerbridge", "toastTestSend", false);
         }
         else if (CONFIG_KEY_PLAYER_OVERRIDE.equals(e.getKey()) || CONFIG_KEY_HISCORE_CATEGORY.equals(e.getKey()))
@@ -383,36 +547,12 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
         else if (CONFIG_KEY_SET_TO_LOGGED_IN_PLAYER_NOW.equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            // Button: set override to the currently logged-in player, reset category to AUTO,
-            // refresh display, and immediately apply/push that identity to the device.
-            clientThread.invokeLater(() ->
-            {
-                String loggedIn = getPlayerName();
-                if (loggedIn == null || loggedIn.trim().isEmpty())
-                {
-                    refreshIdentityDisplay();
-                    return;
-                }
-
-                configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PLAYER_OVERRIDE, loggedIn.trim());
-                configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_HISCORE_CATEGORY,
-                    OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO.name());
-
-                refreshIdentityDisplay();
-                pushConfigNowValidated();
-            });
-
+            uiSetToLoggedInPlayerNow();
             configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_SET_TO_LOGGED_IN_PLAYER_NOW, false);
         }
         else if (CONFIG_KEY_SYNC_CONFIG_NOW.equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            // Button: validate then push
-            clientThread.invokeLater(() ->
-            {
-                refreshIdentityDisplay();
-                pushConfigNowValidated();
-            });
-
+            uiPushResolvedConfigNow();
             configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_SYNC_CONFIG_NOW, false);
         }
     }
@@ -1261,18 +1401,20 @@ private void pushConfigNowValidated()
     if (deviceUrl == null)
     {
         log.debug("Config push blocked: device URL invalid.");
+        uiSetPanelStatus("Push blocked: invalid device URL.");
         return;
     }
-
     if (!isValidPlayerNameLocal(player))
     {
         log.debug("Config push blocked: invalid player name '{}'", player);
+        uiSetPanelStatus("Push blocked: invalid player name.");
         return;
     }
 
     if (!isValidCategoryLocal(category))
     {
         log.debug("Config push blocked: invalid hiscore category '{}'", category);
+        uiSetPanelStatus("Push blocked: invalid hiscore category.");
         return;
     }
 
@@ -1281,9 +1423,9 @@ private void pushConfigNowValidated()
     if (hiscoresUrl == null)
     {
         log.debug("Config push blocked: cannot build hiscores validation URL.");
+        uiSetPanelStatus("Push blocked: validation URL error.");
         return;
     }
-
     executor.execute(() ->
     {
         Request req = new Request.Builder().url(hiscoresUrl).get().build();
@@ -1297,6 +1439,7 @@ private void pushConfigNowValidated()
             {
                 log.debug("Config push blocked: hiscores validation failed HTTP {} (player='{}' cat='{}')",
                     code, player, category);
+                uiSetPanelStatus("Push blocked: player/category not valid (HTTP " + code + ").");
                 return;
             }
         }
@@ -1304,12 +1447,14 @@ private void pushConfigNowValidated()
         {
             log.debug("Config push blocked: hiscores validation IO error (player='{}' cat='{}') err={}",
                 player, category, ex.toString());
+            uiSetPanelStatus("Push blocked: validation request failed.");
             return;
         }
 
         // Valid -> push target config to device
         PushPayload p = PushPayload.configUpdate(player, nextSeq(), player, category);
         enqueue(PendingKind.CONFIG, deviceUrl, p);
+        uiSetPanelStatus("Push queued for " + player + " / " + category);
 
         // Optimistically cache the device target so live gating can react quickly.
         setCachedDeviceTarget(player, category);
@@ -1732,21 +1877,39 @@ private void pushConfigNowValidated()
     private void doPing()
     {
         HttpUrl url = buildUrl("ping");
-        if (url == null) return;
+        if (url == null)
+        {
+            uiSetPanelStatus("Ping failed: invalid device URL.");
+            return;
+        }
+
+        uiSetPanelStatus("Pinging device...");
 
         Request req = new Request.Builder().url(url).get().build();
         http.newCall(req).enqueue(new Callback()
         {
-            @Override public void onFailure(Call call, IOException ex)
+            @Override
+            public void onFailure(Call call, IOException ex)
             {
                 log.debug("ESP32 ping failed: {}", ex.toString());
+                uiSetPanelStatus("Ping failed.");
             }
 
-            @Override public void onResponse(Call call, Response resp) throws IOException
+            @Override
+            public void onResponse(Call call, Response resp) throws IOException
             {
                 try (Response r = resp)
                 {
                     log.debug("ESP32 ping HTTP {}", r.code());
+
+                    if (r.isSuccessful())
+                    {
+                        uiSetPanelStatus("Ping OK (HTTP " + r.code() + ")");
+                    }
+                    else
+                    {
+                        uiSetPanelStatus("Ping failed (HTTP " + r.code() + ")");
+                    }
                 }
             }
         });

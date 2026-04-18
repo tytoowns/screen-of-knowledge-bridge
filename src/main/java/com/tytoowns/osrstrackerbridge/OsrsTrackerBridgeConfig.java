@@ -142,7 +142,8 @@ public interface OsrsTrackerBridgeConfig extends Config
         name = "Push player/category now",
         description = "Checks once to push the resolved player/category config immediately, then auto-resets.",
         section = deviceConfigSection,
-        position = 4
+        position = 4,
+        hidden = true
     )
     default boolean syncConfigNow()
     {
@@ -154,7 +155,8 @@ public interface OsrsTrackerBridgeConfig extends Config
     name = "Set to currently logged in player",
     description = "Sets Player override to your currently logged-in account name, resets Hiscore category to AUTO, and pushes/applies it to the device. Auto-resets.",
     section = deviceConfigSection,
-    position = 5
+    position = 5,
+    hidden = true
     )
     default boolean setToLoggedInPlayerNow()
     {
@@ -166,7 +168,8 @@ public interface OsrsTrackerBridgeConfig extends Config
         keyName = "testPing",
         name = "Test connection (/ping)",
         description = "Toggle ON to call /ping once. It will auto-reset to OFF.",
-        position = 5
+        position = 5,
+        hidden = true
     )
     default boolean testPing()
     {
@@ -177,7 +180,8 @@ public interface OsrsTrackerBridgeConfig extends Config
         keyName = "testPush",
         name = "Send test push (toast)",
         description = "Toggle ON to send a test toast to the ESP32 once. It will auto-reset to OFF.",
-        position = 6
+        position = 6,
+        hidden = true
     )
     default boolean testPush()
     {
@@ -326,7 +330,8 @@ public interface OsrsTrackerBridgeConfig extends Config
         name = "Send test",
         description = "Click to send the selected toast test preset",
         section = testingSection,
-        position = 6
+        position = 6,
+        hidden = true
     )
     default boolean toastTestSend()
     {

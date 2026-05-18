@@ -1,12 +1,11 @@
 package com.tytoowns.osrstrackerbridge;
 
+import net.runelite.api.Skill;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 import net.runelite.client.config.Range;
-import net.runelite.api.Skill;
-import net.runelite.client.config.*;
-
 
 @ConfigGroup("osrstrackerbridge")
 public interface OsrsTrackerBridgeConfig extends Config
@@ -55,30 +54,41 @@ public interface OsrsTrackerBridgeConfig extends Config
         return true;
     }
 
-    @ConfigSection(
-        name = "Device Config Sync",
-        description = "Current resolved player/category plus manual overrides for the device",
-        position = 4
-    )
-    String deviceConfigSection = "deviceConfigSection";
 
-    enum HiscoreCategoryChoice
+
+    enum DisplayMode
     {
-        AUTO("AUTO"),
-        NORMAL("hiscore_oldschool"),
-        IRONMAN("hiscore_oldschool_ironman"),
-        HARDCORE_IRONMAN("hiscore_oldschool_hardcore_ironman"),
-        ULTIMATE_IRONMAN("hiscore_oldschool_ultimate"),
-        DEADMAN("hiscore_oldschool_deadman"),
-        SEASONAL("hiscore_oldschool_seasonal"),
-        TOURNAMENT("hiscore_oldschool_tournament"),
-        FRESH_START("hiscore_oldschool_fresh_start");
+        FIXED_PROFILE,
+        FIXED_PLAYER_AUTO_CATEGORY,
+        FOLLOW_ACTIVE_SOURCE
+    }
 
+    enum GameModeChoice
+    {
+        NORMAL("normal", "hiscore_oldschool"),
+        IRONMAN("ironman", "hiscore_oldschool_ironman"),
+        HARDCORE_IRONMAN("hc_ironman", "hiscore_oldschool_hardcore_ironman"),
+        ULTIMATE_IRONMAN("u_ironman", "hiscore_oldschool_ultimate"),
+        GROUP_IRONMAN("group_ironman", "hiscore_oldschool"),
+        GROUP_HARDCORE_IRONMAN("group_hc_ironman", "hiscore_oldschool"),
+        GROUP_UNRANKED_IRONMAN("group_unranked_ironman", "hiscore_oldschool"),
+        LEAGUE("league", "hiscore_oldschool_seasonal"),
+        DEADMAN("deadman", "hiscore_oldschool_deadman"),
+        TOURNAMENT("tournament", "hiscore_oldschool_tournament"),
+        FRESH_START("fresh_start", "hiscore_oldschool_fresh_start");
+
+        private final String gameModeKey;
         private final String endpoint;
 
-        HiscoreCategoryChoice(String endpoint)
+        GameModeChoice(String gameModeKey, String endpoint)
         {
+            this.gameModeKey = gameModeKey;
             this.endpoint = endpoint;
+        }
+
+        public String gameModeKey()
+        {
+            return gameModeKey;
         }
 
         public String endpoint()
@@ -88,61 +98,83 @@ public interface OsrsTrackerBridgeConfig extends Config
     }
 
     @ConfigItem(
-        keyName = "currentPlayerDisplay",
-        name = "Current player",
+        keyName = "targetPlayerDisplay",
+        name = "Target player",
         description = "Status only. Updated by the plugin.",
-        section = deviceConfigSection,
         position = 0,
         hidden = true
     )
-    default String currentPlayerDisplay()
+    default String targetPlayerDisplay()
     {
         return "";
     }
 
     @ConfigItem(
-        keyName = "currentHiscoreCategoryDisplay",
-        name = "Current hiscore category",
+        keyName = "targetHiscoreCategoryDisplay",
+        name = "Target hiscore category",
         description = "Status only. Updated by the plugin.",
-        section = deviceConfigSection,
         position = 1,
         hidden = true
     )
-    default String currentHiscoreCategoryDisplay()
+    default String targetHiscoreCategoryDisplay()
     {
         return "";
     }
 
     @ConfigItem(
-        keyName = "playerOverride",
-        name = "Player override",
-        description = "Leave blank to use the currently logged-in player name.",
-        section = deviceConfigSection,
-        position = 2
+        keyName = "displayMode",
+        name = "Display mode",
+        description = "How the device chooses which profile to show.",
+        position = 2,
+        hidden = true
     )
-    default String playerOverride()
+    default DisplayMode displayMode()
+    {
+        return DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
+    }
+
+    @ConfigItem(
+        keyName = "pinnedPlayer",
+        name = "Pinned player",
+        description = "Used by Fixed Profile and Fixed Player Auto-Switch modes.",
+        position = 3,
+        hidden = true
+    )
+    default String pinnedPlayer()
     {
         return "";
     }
 
     @ConfigItem(
-        keyName = "hiscoreCategory",
-        name = "Hiscore category",
-        description = "AUTO uses current world/account state. Any other value overrides it.",
-        section = deviceConfigSection,
-        position = 3
+        keyName = "pinnedGameMode",
+        name = "Pinned game mode",
+        description = "Used by Fixed Profile and API-only mode.",
+        position = 4,
+        hidden = true
     )
-    default HiscoreCategoryChoice hiscoreCategory()
+    default GameModeChoice pinnedGameMode()
     {
-        return HiscoreCategoryChoice.AUTO;
+        return GameModeChoice.NORMAL;
     }
+
+    @ConfigItem(
+        keyName = "apiOnly",
+        name = "API-only mode",
+        description = "Ignore live plugin stats/toasts and use API + persisted data only.",
+        position = 5,
+        hidden = true
+    )
+    default boolean apiOnly()
+    {
+        return false;
+    }
+
 
     @ConfigItem(
         keyName = "syncConfigNow",
-        name = "Push player/category now",
-        description = "Checks once to push the resolved player/category config immediately, then auto-resets.",
-        section = deviceConfigSection,
-        position = 4,
+        name = "Apply mode/profile now",
+        description = "Pushes the current effective target/device mode config once, then auto-resets.",
+        position = 6,
         hidden = true
     )
     default boolean syncConfigNow()
@@ -151,12 +183,11 @@ public interface OsrsTrackerBridgeConfig extends Config
     }
 
     @ConfigItem(
-    keyName = "setToLoggedInPlayerNow",
-    name = "Set to currently logged in player",
-    description = "Sets Player override to your currently logged-in account name, resets Hiscore category to AUTO, and pushes/applies it to the device. Auto-resets.",
-    section = deviceConfigSection,
-    position = 5,
-    hidden = true
+        keyName = "setToLoggedInPlayerNow",
+        name = "Set to currently logged in player",
+        description = "Applies the currently logged-in player according to the active display mode, then pushes to the device. Auto-resets.",
+        position = 7,
+        hidden = true
     )
     default boolean setToLoggedInPlayerNow()
     {

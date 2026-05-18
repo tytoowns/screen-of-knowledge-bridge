@@ -13,7 +13,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import javax.inject.Inject;
-import lombok.extern.slf4j.Slf4j;
+
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.InventoryID;
@@ -48,10 +48,11 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import net.runelite.api.events.WorldChanged;
 
 
-
-@Slf4j
 @PluginDescriptor(
     name = "Screen Of Knowledge Bridge",
         description = "Pushes skill updates + bank total + toast milestones to the SoK (Screen Of Knowledge) on your LAN"
@@ -59,6 +60,8 @@ import net.runelite.client.ui.NavigationButton;
 )
 public class ScreenOfKnowledgeBridgePlugin extends Plugin
 {
+    private static final Logger log = LoggerFactory.getLogger(ScreenOfKnowledgeBridgePlugin.class);
+
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
     private volatile String cachedPlayerName = null;
     private NavigationButton navButton;
@@ -66,13 +69,18 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     @Inject private ClientToolbar clientToolbar;
 
     private static final String CONFIG_GROUP = "osrstrackerbridge";
-    private static final String CONFIG_KEY_CURRENT_PLAYER_DISPLAY = "currentPlayerDisplay";
-    private static final String CONFIG_KEY_CURRENT_HISCORE_CATEGORY_DISPLAY = "currentHiscoreCategoryDisplay";
-    private static final String CONFIG_KEY_PLAYER_OVERRIDE = "playerOverride";
-    private static final String CONFIG_KEY_HISCORE_CATEGORY = "hiscoreCategory";
+    private static final String CONFIG_KEY_TARGET_PLAYER_DISPLAY = "targetPlayerDisplay";
+    private static final String CONFIG_KEY_TARGET_HISCORE_CATEGORY_DISPLAY = "targetHiscoreCategoryDisplay";
+
+    private static final String CONFIG_KEY_DISPLAY_MODE = "displayMode";
+    private static final String CONFIG_KEY_PINNED_PLAYER = "pinnedPlayer";
+    private static final String CONFIG_KEY_PINNED_GAME_MODE = "pinnedGameMode";
+    private static final String CONFIG_KEY_API_ONLY = "apiOnly";
+
     private static final String CONFIG_KEY_SYNC_CONFIG_NOW = "syncConfigNow";
     private static final String CONFIG_KEY_SET_TO_LOGGED_IN_PLAYER_NOW = "setToLoggedInPlayerNow";
     private static final String CONFIG_KEY_LAST_BANK_TOTAL_PREFIX = "lastKnownBankTotal.";
+    private static final String BANK_KEY_SEP = "|";
 
     // Timings / policy (existing)
     private static final long XP_TICK_MS = 5_000;
@@ -82,11 +90,31 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     private static final long BANK_DEBOUNCE_MS = 650;
     private static final int  INCLUDE_TOTAL_LEVEL_EVERY_N_XP_TICKS = 12;
 
-    private void updateCurrentConfigDisplay(String player, String hiscoreCategoryDisplay)
-{
-    configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_CURRENT_PLAYER_DISPLAY, player == null ? "" : player);
-    configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_CURRENT_HISCORE_CATEGORY_DISPLAY, hiscoreCategoryDisplay == null ? "" : hiscoreCategoryDisplay);
-}
+    private static final String[] FIXED_PLAYER_AUTO_CATEGORY_PROBE_ORDER = new String[] {
+        "hiscore_oldschool",
+        "hiscore_oldschool_ironman",
+        "hiscore_oldschool_hardcore_ironman",
+        "hiscore_oldschool_ultimate",
+        "hiscore_oldschool_seasonal",
+        "hiscore_oldschool_deadman",
+        "hiscore_oldschool_tournament",
+        "hiscore_oldschool_fresh_start"
+    };
+
+    private void updateTargetDisplay(String player, String hiscoreCategory)
+    {
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_TARGET_PLAYER_DISPLAY,
+            player == null ? "" : player
+        );
+
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_TARGET_HISCORE_CATEGORY_DISPLAY,
+            hiscoreCategory == null ? "" : hiscoreCategory
+        );
+    }
 
 
         // --------------------
@@ -228,8 +256,31 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     private ScheduledFuture<?> bankDebounceFuture;
     private ScheduledFuture<?> deviceStatusFuture;
 
+    private volatile String cachedDeviceDisplayMode = null;
+    private volatile String cachedDevicePinnedPlayer = null;
+    private volatile String cachedDevicePinnedGameMode = null;
+    private volatile String cachedDevicePinnedCategory = null;
+    private volatile Boolean cachedDeviceApiOnly = null;
+
     private volatile String cachedDeviceTargetPlayer = null;
+    private volatile String cachedDeviceTargetGameMode = null;
     private volatile String cachedDeviceTargetCategory = null;
+
+    private volatile String cachedDeviceVisiblePlayer = null;
+    private volatile String cachedDeviceVisibleGameMode = null;
+    private volatile String cachedDeviceVisibleCategory = null;
+    private volatile Boolean cachedDevicePluginHeartbeatFresh = null;
+    private volatile Boolean cachedDevicePluginDisplayAllowed = null;
+    private volatile String cachedDeviceLiveOwnerPlayer = null;
+    private volatile String cachedDeviceLiveOwnerGameMode = null;
+    private volatile String cachedDeviceLiveOwnerCategory = null;
+    private volatile boolean followBootstrapSentForCurrentOwnership = false;
+
+    private volatile String lastDeviceSettingsSnapshot = null;
+
+    private volatile String cachedCurrentPlayerName = "-";
+    private volatile String cachedCurrentHiscoreCategoryDisplay = "-";
+    private volatile String cachedCurrentModeDisplay = "-";
 
     private long xpTickCounter = 0;
 
@@ -272,6 +323,7 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 
         cancelFutures();
         clearSenderState();
+        lastDeviceSettingsSnapshot = null;
 
         sidePanel = new ScreenOfKnowledgeBridgePanel(this);
 
@@ -297,17 +349,29 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
             {
                 seedLastLevelsFromClient();
                 refreshTotalsCacheFromClient();
-                refreshIdentityDisplay();
+                refreshCurrentProfileInfoCache();
+                refreshTargetDisplay();
 
                 String loggedIn = getPushPlayer();
-                Long savedBankTotal = loadLastKnownBankTotalForPlayer(loggedIn);
+                String category = resolveTargetHiscoreCategoryFromMode();
+                Long savedBankTotal = loadLastKnownBankTotalForProfile(loggedIn, category);
                 if (savedBankTotal != null)
                 {
                     lastSentBankTotal = savedBankTotal;
                 }
+                else
+                {
+                    lastSentBankTotal = -1;
+                }
 
                 pollDeviceStatusOnce();
                 startDeviceStatusTicker();
+
+                // Startup can also see stale world-type state for a moment.
+                // Re-announce after a short delay so FIXED_PLAYER_AUTO_CATEGORY / FOLLOW_ACTIVE_SOURCE
+                // resolve the correct auto category without sending a manual config update.
+                scheduleDelayedAutoSourceAnnounce(600);
+                scheduleDelayedAutoSourceAnnounce(1500);
 
                 executor.schedule(() -> clientThread.invokeLater(() ->
                 {
@@ -342,6 +406,21 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         clearSenderState();
         bankOpen = false;
         setCachedDeviceTarget(null, null);
+        cachedDeviceDisplayMode = null;
+        cachedDevicePinnedPlayer = null;
+        cachedDevicePinnedGameMode = null;
+        cachedDevicePinnedCategory = null;
+        cachedDeviceApiOnly = null;
+        cachedDeviceVisiblePlayer = null;
+        cachedDeviceVisibleGameMode = null;
+        cachedDeviceVisibleCategory = null;
+        cachedDevicePluginHeartbeatFresh = null;
+        cachedDevicePluginDisplayAllowed = null;
+        cachedDeviceLiveOwnerPlayer = null;
+        cachedDeviceLiveOwnerGameMode = null;
+        cachedDeviceLiveOwnerCategory = null;
+        followBootstrapSentForCurrentOwnership = false;
+        lastDeviceSettingsSnapshot = null;
     }
 
     private void cancelFutures()
@@ -402,39 +481,115 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         return new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
     }
 
-    void uiPushResolvedConfigNow()
+    void uiApplyModeProfileNow()
     {
-        uiSetPanelStatus("Pushing player/category...");
+        uiSetPanelStatus("Applying mode/profile to device...");
 
         clientThread.invokeLater(() ->
         {
-            refreshIdentityDisplay();
+            refreshTargetDisplay();
             pushConfigNowValidated();
         });
     }
 
     void uiSetToLoggedInPlayerNow()
     {
-        uiSetPanelStatus("Applying logged-in player...");
+        uiSetPanelStatus("Applying logged-in player for current mode...");
 
         clientThread.invokeLater(() ->
         {
             String loggedIn = getPlayerName();
             if (loggedIn == null || loggedIn.trim().isEmpty())
             {
-                refreshIdentityDisplay();
+                refreshTargetDisplay();
                 uiSetPanelStatus("No logged-in player found.");
                 return;
             }
 
-            configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PLAYER_OVERRIDE, loggedIn.trim());
-            configManager.setConfiguration(
-                CONFIG_GROUP,
-                CONFIG_KEY_HISCORE_CATEGORY,
-                OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO.name()
-            );
+            String loggedInTrimmed = loggedIn.trim();
 
-            refreshIdentityDisplay();
+            boolean apiOnly = cachedDeviceApiOnly != null ? cachedDeviceApiOnly : config.apiOnly();
+
+            OsrsTrackerBridgeConfig.DisplayMode mode;
+            if (cachedDeviceDisplayMode != null && !cachedDeviceDisplayMode.trim().isEmpty())
+            {
+                try
+                {
+                    mode = OsrsTrackerBridgeConfig.DisplayMode.valueOf(cachedDeviceDisplayMode.trim());
+                }
+                catch (IllegalArgumentException ex)
+                {
+                    mode = config.displayMode();
+                }
+            }
+            else
+            {
+                mode = config.displayMode();
+            }
+
+            if (mode == null)
+            {
+                mode = OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
+            }
+
+            configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_API_ONLY, apiOnly);
+            configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_DISPLAY_MODE, mode.name());
+
+            if (apiOnly)
+            {
+                configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PINNED_PLAYER, loggedInTrimmed);
+
+                String deviceGameMode = deriveDeviceGameMode();
+                OsrsTrackerBridgeConfig.GameModeChoice mappedChoice =
+                    mapGameModeKeyToChoice(deviceGameMode);
+
+                configManager.setConfiguration(
+                    CONFIG_GROUP,
+                    CONFIG_KEY_PINNED_GAME_MODE,
+                    mappedChoice.name()
+                );
+            }
+            else
+            {
+                switch (mode)
+                {
+                    case FIXED_PROFILE:
+                    {
+                        configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PINNED_PLAYER, loggedInTrimmed);
+
+                        String deviceGameMode = deriveDeviceGameMode();
+                        OsrsTrackerBridgeConfig.GameModeChoice mappedChoice =
+                            mapGameModeKeyToChoice(deviceGameMode);
+
+                        configManager.setConfiguration(
+                            CONFIG_GROUP,
+                            CONFIG_KEY_PINNED_GAME_MODE,
+                            mappedChoice.name()
+                        );
+                        break;
+                    }
+
+                    case FIXED_PLAYER_AUTO_CATEGORY:
+                    {
+                        configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PINNED_PLAYER, loggedInTrimmed);
+                        break;
+                    }
+
+                    case FOLLOW_ACTIVE_SOURCE:
+                    {
+                        // keep mode exactly as device reported; do not force pinned fields
+                        break;
+                    }
+
+                    default:
+                    {
+                        configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PINNED_PLAYER, loggedInTrimmed);
+                        break;
+                    }
+                }
+            }
+
+            refreshTargetDisplay();
 
             if (sidePanel != null)
             {
@@ -462,43 +617,127 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         runToastTestPreset();
     }
 
-    void uiSetPlayerOverride(String value)
-    {
-        configManager.setConfiguration(
-            CONFIG_GROUP,
-            CONFIG_KEY_PLAYER_OVERRIDE,
-            value == null ? "" : value.trim()
-        );
 
-        clientThread.invokeLater(this::refreshIdentityDisplay);
-    }
 
-    void uiSetHiscoreCategory(OsrsTrackerBridgeConfig.HiscoreCategoryChoice choice)
+
+
+        void uiSetDisplayMode(OsrsTrackerBridgeConfig.DisplayMode mode)
     {
-        if (choice == null)
+        if (mode == null)
         {
-            choice = OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO;
+            mode = OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
         }
 
         configManager.setConfiguration(
             CONFIG_GROUP,
-            CONFIG_KEY_HISCORE_CATEGORY,
-            choice.name()
+            CONFIG_KEY_DISPLAY_MODE,
+            mode.name()
         );
-
-        clientThread.invokeLater(this::refreshIdentityDisplay);
     }
 
-    String uiGetPlayerOverride()
+    void uiSetPinnedPlayer(String value)
     {
-        String value = config.playerOverride();
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_PINNED_PLAYER,
+            value == null ? "" : value.trim()
+        );
+    }
+
+    void uiSetPinnedGameMode(OsrsTrackerBridgeConfig.GameModeChoice choice)
+    {
+        if (choice == null)
+        {
+            choice = OsrsTrackerBridgeConfig.GameModeChoice.NORMAL;
+        }
+
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_PINNED_GAME_MODE,
+            choice.name()
+        );
+    }
+
+    void uiSetApiOnly(boolean value)
+    {
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_API_ONLY,
+            value
+        );
+    }
+
+    OsrsTrackerBridgeConfig.DisplayMode uiGetDisplayMode()
+    {
+        OsrsTrackerBridgeConfig.DisplayMode mode = config.displayMode();
+        return mode == null ? OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY : mode;
+    }
+
+    String uiGetPinnedPlayer()
+    {
+        String value = config.pinnedPlayer();
         return value == null ? "" : value;
     }
 
-    OsrsTrackerBridgeConfig.HiscoreCategoryChoice uiGetHiscoreCategoryChoice()
+    OsrsTrackerBridgeConfig.GameModeChoice uiGetPinnedGameMode()
     {
-        OsrsTrackerBridgeConfig.HiscoreCategoryChoice choice = config.hiscoreCategory();
-        return choice == null ? OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO : choice;
+        OsrsTrackerBridgeConfig.GameModeChoice choice = config.pinnedGameMode();
+        return choice == null ? OsrsTrackerBridgeConfig.GameModeChoice.NORMAL : choice;
+    }
+
+    boolean uiIsApiOnly()
+    {
+        return config.apiOnly();
+    }
+
+    String uiGetDeviceDisplayMode()
+    {
+        return cachedDeviceDisplayMode;
+    }
+
+    String uiGetDeviceTargetPlayer()
+    {
+        return cachedDeviceTargetPlayer;
+    }
+
+    String uiGetDeviceTargetCategory()
+    {
+        return cachedDeviceTargetCategory;
+    }
+
+    String uiGetDeviceVisiblePlayer()
+    {
+        return cachedDeviceVisiblePlayer;
+    }
+
+    String uiGetDeviceVisibleCategory()
+    {
+        return cachedDeviceVisibleCategory;
+    }
+
+    Boolean uiGetDevicePluginHeartbeatFresh()
+    {
+        return cachedDevicePluginHeartbeatFresh;
+    }
+
+    Boolean uiGetDevicePluginDisplayAllowed()
+    {
+        return cachedDevicePluginDisplayAllowed;
+    }
+
+    String uiGetDeviceLiveOwnerPlayer()
+    {
+        return cachedDeviceLiveOwnerPlayer;
+    }
+
+    String uiGetDeviceLiveOwnerGameMode()
+    {
+        return cachedDeviceLiveOwnerGameMode;
+    }
+
+    String uiGetDeviceLiveOwnerCategory()
+    {
+        return cachedDeviceLiveOwnerCategory;
     }
 
     void uiSetPanelStatus(String text)
@@ -507,6 +746,21 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         {
             sidePanel.setStatusText(text);
         }
+    }
+
+    String uiGetCurrentPlayerName()
+    {
+        return cachedCurrentPlayerName;
+    }
+
+    String uiGetCurrentHiscoreCategoryDisplay()
+    {
+        return cachedCurrentHiscoreCategoryDisplay;
+    }
+
+    String uiGetCurrentModeDisplay()
+    {
+        return cachedCurrentModeDisplay;
     }
 
     // ---- config toggles ----
@@ -519,8 +773,8 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
 
 
-        if (CONFIG_KEY_CURRENT_PLAYER_DISPLAY.equals(e.getKey())
-            || CONFIG_KEY_CURRENT_HISCORE_CATEGORY_DISPLAY.equals(e.getKey()))
+        if (CONFIG_KEY_TARGET_PLAYER_DISPLAY.equals(e.getKey())
+            || CONFIG_KEY_TARGET_HISCORE_CATEGORY_DISPLAY.equals(e.getKey()))
         {
             return;
         }
@@ -540,10 +794,12 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
             uiSendSelectedToastTest();
             configManager.setConfiguration("osrstrackerbridge", "toastTestSend", false);
         }
-        else if (CONFIG_KEY_PLAYER_OVERRIDE.equals(e.getKey()) || CONFIG_KEY_HISCORE_CATEGORY.equals(e.getKey()))
+        else if (CONFIG_KEY_DISPLAY_MODE.equals(e.getKey())
+            || CONFIG_KEY_PINNED_PLAYER.equals(e.getKey())
+            || CONFIG_KEY_PINNED_GAME_MODE.equals(e.getKey())
+            || CONFIG_KEY_API_ONLY.equals(e.getKey()))
         {
-            // Only refresh the display; DO NOT push config just because dropdown/text changed
-            scheduleIdentityRefreshAndConfigSync(false);
+            scheduleTargetRefreshAndConfigSync(false);
         }
         else if (CONFIG_KEY_SET_TO_LOGGED_IN_PLAYER_NOW.equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
@@ -552,7 +808,7 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
         else if (CONFIG_KEY_SYNC_CONFIG_NOW.equals(e.getKey()) && "true".equals(e.getNewValue()))
         {
-            uiPushResolvedConfigNow();
+            uiApplyModeProfileNow();
             configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_SYNC_CONFIG_NOW, false);
         }
     }
@@ -732,19 +988,34 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
             // Prevent login stat sync from generating toast batches
             toastSuppressUntilMs = System.currentTimeMillis() + LOGIN_TOAST_SUPPRESS_MS;
             clearToastAggState();
+            followBootstrapSentForCurrentOwnership = false;
 
             seedLastLevelsFromClient();
             refreshTotalsCacheFromClient();
-            refreshIdentityDisplay();
+            refreshCurrentProfileInfoCache();
+            refreshTargetDisplay();
 
             String loggedIn = getPushPlayer();
-            Long savedBankTotal = loadLastKnownBankTotalForPlayer(loggedIn);
+            String category = resolveTargetHiscoreCategoryFromMode();
+            Long savedBankTotal = loadLastKnownBankTotalForProfile(loggedIn, category);
             if (savedBankTotal != null)
             {
                 lastSentBankTotal = savedBankTotal;
             }
+            else
+            {
+                lastSentBankTotal = -1;
+            }
+
             pollDeviceStatusOnce();
             startDeviceStatusTicker();
+
+            // Do NOT manually config-push.
+            // On login/world-hop the world type can still be stale for a moment,
+            // auto-category can incorrectly resolve as normal.
+            // Re-announce shortly after the client settles.
+            scheduleDelayedAutoSourceAnnounce(600);
+            scheduleDelayedAutoSourceAnnounce(1500);
 
             executor.schedule(() -> clientThread.invokeLater(() ->
             {
@@ -761,12 +1032,28 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
         else
         {
+            followBootstrapSentForCurrentOwnership = false;
+            lastDeviceSettingsSnapshot = null;
             stopXpTicker();
             stopHeartbeatTicker();
             stopSnapshotTicker();
             stopDeviceStatusTicker();
-            refreshIdentityDisplay();
+            refreshCurrentProfileInfoCache();
+            refreshTargetDisplay();
             setCachedDeviceTarget(null, null);
+            cachedDeviceDisplayMode = null;
+            cachedDevicePinnedPlayer = null;
+            cachedDevicePinnedGameMode = null;
+            cachedDevicePinnedCategory = null;
+            cachedDeviceApiOnly = null;
+            cachedDeviceVisiblePlayer = null;
+            cachedDeviceVisibleGameMode = null;
+            cachedDeviceVisibleCategory = null;
+            cachedDevicePluginHeartbeatFresh = null;
+            cachedDevicePluginDisplayAllowed = null;
+            cachedDeviceLiveOwnerPlayer = null;
+            cachedDeviceLiveOwnerGameMode = null;
+            cachedDeviceLiveOwnerCategory = null;
 
             bankOpen = false;
             if (bankDebounceFuture != null)
@@ -976,6 +1263,8 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         if (e.getGroupId() == InterfaceID.BANK)
         {
             bankOpen = true;
+            log.info("BANK widget loaded -> bankOpen=true enableBankTotalPush={}", config.enableBankTotalPush());
+
             if (config.enableBankTotalPush())
             {
                 scheduleBankDebounced(false);
@@ -988,6 +1277,8 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
     {
         if (e.getGroupId() == InterfaceID.BANK)
         {
+            log.info("BANK widget closed -> flushing final value, bankOpen was {}", bankOpen);
+
             if (config.enableBankTotalPush())
             {
                 flushBankNow(true);
@@ -1002,6 +1293,26 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
     }
 
+    @Subscribe
+    public void onWorldChanged(WorldChanged event)
+    {
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            return;
+        }
+
+        log.info("WorldChanged -> worldTypes={} player={}", client.getWorldType(), getPlayerName());
+
+        refreshCurrentProfileInfoCache();
+        refreshTargetDisplay();
+
+        if (config.displayMode() == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY
+            || config.displayMode() == OsrsTrackerBridgeConfig.DisplayMode.FOLLOW_ACTIVE_SOURCE)
+        {
+            enqueueSourceAnnounceNow();
+        }
+    }
+
     // ---- Container changes: bank + equipment ----
     @Subscribe
     public void onItemContainerChanged(ItemContainerChanged e)
@@ -1009,6 +1320,14 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         if (client.getGameState() != GameState.LOGGED_IN)
         {
             return;
+        }
+
+        if (e.getContainerId() == InventoryID.BANK.getId())
+        {
+            log.info("BANK container changed -> bankOpen={} enableBankTotalPush={} containerId={}",
+                bankOpen,
+                config.enableBankTotalPush(),
+                e.getContainerId());
         }
 
         // Bank changes (existing behavior)
@@ -1020,6 +1339,8 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 
     private void scheduleBankDebounced(boolean forceEvenIfSame)
     {
+        log.info("BANK debounce scheduled forceEvenIfSame={} bankOpen={}", forceEvenIfSame, bankOpen);
+
         if (bankDebounceFuture != null)
         {
             bankDebounceFuture.cancel(false);
@@ -1043,6 +1364,12 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 
     private void flushBankNow(boolean forceEvenIfSame)
     {
+        log.info("BANK flush start forceEvenIfSame={} bankOpen={} canSendLive={} lastSentBankTotal={}",
+            forceEvenIfSame,
+            bankOpen,
+            canSendLiveForCurrentLogin(),
+            lastSentBankTotal);
+
         if (!canSendLiveForCurrentLogin())
         {
             return;
@@ -1056,15 +1383,27 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         }
 
         long total = computeBankTotal();
+        log.info("BANK flush computed total={} previous={} forceEvenIfSame={}",
+            total,
+            lastSentBankTotal,
+            forceEvenIfSame);
+
         if (!forceEvenIfSame && total == lastSentBankTotal)
         {
+            log.info("BANK flush skipped because total unchanged");
             return;
         }
 
-        lastSentBankTotal = total;
-        saveLastKnownBankTotalForPlayer(player, total);
+        log.info("BANK flush sending total={} player='{}' category='{}'",
+            total,
+            player,
+            resolveTargetHiscoreCategoryFromMode());
 
-        PushPayload p = PushPayload.bankUpdate(player, nextSeq(), total);
+        lastSentBankTotal = total;
+        saveLastKnownBankTotalForProfile(player, resolveTargetHiscoreCategoryFromMode(), total);
+
+        String hiscoreCategory = deriveAutoHiscoreCategory();
+        PushPayload p = PushPayload.bankUpdate(player, nextSeq(), total, hiscoreCategory);
         enqueue(PendingKind.BANK, url, p);
     }
 
@@ -1083,7 +1422,7 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
             return;
         }
 
-        Long savedBankTotal = loadLastKnownBankTotalForPlayer(player);
+        Long savedBankTotal = loadLastKnownBankTotalForProfile(player, resolveTargetHiscoreCategoryFromMode());
         if (savedBankTotal == null)
         {
             return;
@@ -1091,8 +1430,56 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
 
         lastSentBankTotal = savedBankTotal;
 
-        PushPayload p = PushPayload.bankUpdate(player, nextSeq(), savedBankTotal);
+        String hiscoreCategory = deriveAutoHiscoreCategory();
+        PushPayload p = PushPayload.bankUpdate(player, nextSeq(), savedBankTotal, hiscoreCategory);
         enqueue(PendingKind.BANK, url, p);
+    }
+
+    private void enqueueImmediateHeartbeatNow()
+    {
+        if (!canSendLiveForCurrentLogin())
+        {
+            return;
+        }
+
+        String player = getPushPlayer();
+        HttpUrl url = buildUrl("push");
+        if (player == null || url == null)
+        {
+            return;
+        }
+
+        PushPayload p = PushPayload.heartbeat(player, nextSeq());
+        enqueue(PendingKind.HEARTBEAT, url, p);
+    }
+
+    private void enqueueSourceAnnounceNow()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            return;
+        }
+
+        if (Boolean.TRUE.equals(cachedDeviceApiOnly))
+        {
+            return;
+        }
+
+        String player = getPushPlayer();
+        HttpUrl url = buildUrl("push");
+        if (player == null || url == null)
+        {
+            return;
+        }
+
+        String hiscoreCategory = resolveTargetHiscoreCategoryFromMode();
+        String gameMode = deriveDeviceGameMode();
+
+        PushPayload p = PushPayload.sourceAnnounce(player, nextSeq(), hiscoreCategory, gameMode);
+        enqueue(PendingKind.CONFIG, url, p);
+
+        log.info("SOURCE ANNOUNCE queued: player='{}' cat='{}' gameMode='{}' displayMode='{}'",
+            player, hiscoreCategory, gameMode, config.displayMode());
     }
 
     // ---- Snapshot helpers ----
@@ -1153,93 +1540,498 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         return sum;
     }
 
-
-    // --------------------
-    // Name / URL helpers
-    // --------------------
-    private String getManualPlayerOverride()
-    {
-        String s = config.playerOverride();
-        if (s == null)
-        {
-            return null;
-        }
-
-        s = s.trim();
-        return s.isEmpty() ? null : s;
-    }
-
-    private String resolveEffectivePlayerName()
-    {
-        String override = getManualPlayerOverride();
-        if (override != null)
-        {
-            return override;
-        }
-
-        return getPlayerName();
-    }
-
-    private String deriveAutoHiscoreCategory()
+    private String deriveDeviceGameMode()
     {
         Set<WorldType> worldTypes = client.getWorldType();
+        int accountType = client.getVarbitValue(Varbits.ACCOUNT_TYPE);
+
         if (worldTypes != null)
         {
             if (worldTypes.contains(WorldType.SEASONAL))
             {
-                return "hiscore_oldschool_seasonal";
+                return "league";
             }
             if (worldTypes.contains(WorldType.DEADMAN))
             {
-                return "hiscore_oldschool_deadman";
+                return "deadman";
             }
             if (worldTypes.contains(WorldType.TOURNAMENT_WORLD))
             {
-                return "hiscore_oldschool_tournament";
+                return "tournament";
             }
             if (worldTypes.contains(WorldType.FRESH_START_WORLD))
             {
-                return "hiscore_oldschool_fresh_start";
+                return "fresh_start";
             }
         }
 
-        int accountType = client.getVarbitValue(Varbits.ACCOUNT_TYPE);
         switch (accountType)
         {
             case 1:
-                return "hiscore_oldschool_ironman";
+                return "ironman";
+
             case 2:
-                return "hiscore_oldschool_ultimate";
+                return "u_ironman";
+
             case 3:
-                return "hiscore_oldschool_hardcore_ironman";
+                return "hc_ironman";
+
+            case 4:
+                return "group_ironman";
+
+            case 5:
+                return "group_hc_ironman";
+
+            case 6:
+                return "group_unranked_ironman";
+
             default:
-                return "hiscore_oldschool";
+                return "normal";
         }
     }
 
-    private String resolveEffectiveHiscoreCategory()
+    private String deriveDeviceGameModeFromSnapshot(Set<WorldType> worldTypes, int accountType)
     {
-        OsrsTrackerBridgeConfig.HiscoreCategoryChoice choice = config.hiscoreCategory();
-        if (choice != null && choice != OsrsTrackerBridgeConfig.HiscoreCategoryChoice.AUTO)
+        if (worldTypes != null)
         {
+            if (worldTypes.contains(WorldType.SEASONAL))
+            {
+                return "league";
+            }
+            if (worldTypes.contains(WorldType.DEADMAN))
+            {
+                return "deadman";
+            }
+            if (worldTypes.contains(WorldType.TOURNAMENT_WORLD))
+            {
+                return "tournament";
+            }
+            if (worldTypes.contains(WorldType.FRESH_START_WORLD))
+            {
+                return "fresh_start";
+            }
+        }
+
+        switch (accountType)
+        {
+            case 1:
+                return "ironman";
+
+            case 2:
+                return "u_ironman";
+
+            case 3:
+                return "hc_ironman";
+
+            case 4:
+                return "group_ironman";
+
+            case 5:
+                return "group_hc_ironman";
+
+            case 6:
+                return "group_unranked_ironman";
+
+            default:
+                return "normal";
+        }
+    }
+
+    // --------------------
+    // Name / URL helpers
+    // --------------------
+private String deriveAutoHiscoreCategory()
+{
+    Set<WorldType> worldTypes = client.getWorldType();
+    int accountType = client.getVarbitValue(Varbits.ACCOUNT_TYPE);
+
+    String resolved;
+
+    if (worldTypes != null)
+    {
+        if (worldTypes.contains(WorldType.SEASONAL))
+        {
+            resolved = "hiscore_oldschool_seasonal";
+            log.info("deriveAutoHiscoreCategory -> {} (worldTypes={}, accountType={})", resolved, worldTypes, accountType);
+            return resolved;
+        }
+        if (worldTypes.contains(WorldType.DEADMAN))
+        {
+            resolved = "hiscore_oldschool_deadman";
+            log.info("deriveAutoHiscoreCategory -> {} (worldTypes={}, accountType={})", resolved, worldTypes, accountType);
+            return resolved;
+        }
+        if (worldTypes.contains(WorldType.TOURNAMENT_WORLD))
+        {
+            resolved = "hiscore_oldschool_tournament";
+            log.info("deriveAutoHiscoreCategory -> {} (worldTypes={}, accountType={})", resolved, worldTypes, accountType);
+            return resolved;
+        }
+        if (worldTypes.contains(WorldType.FRESH_START_WORLD))
+        {
+            resolved = "hiscore_oldschool_fresh_start";
+            log.info("deriveAutoHiscoreCategory -> {} (worldTypes={}, accountType={})", resolved, worldTypes, accountType);
+            return resolved;
+        }
+    }
+
+    switch (accountType)
+    {
+        case 1:
+            resolved = "hiscore_oldschool_ironman";
+            break;
+
+        case 2:
+            resolved = "hiscore_oldschool_ultimate";
+            break;
+
+        case 3:
+            resolved = "hiscore_oldschool_hardcore_ironman";
+            break;
+
+        case 4: // Group Ironman
+        case 5: // Group Hardcore Ironman
+        case 6: // Unranked Group Ironman
+            resolved = "hiscore_oldschool";
+            break;
+
+        default:
+            resolved = "hiscore_oldschool";
+            break;
+    }
+
+    log.info("deriveAutoHiscoreCategory -> {} (worldTypes={}, accountType={})", resolved, worldTypes, accountType);
+    return resolved;
+}
+
+    private String displayNameForHiscoreCategory(String endpoint)
+    {
+        if (endpoint == null || endpoint.trim().isEmpty())
+        {
+            return "-";
+        }
+
+        switch (endpoint.trim())
+        {
+            case "hiscore_oldschool":
+                return "Normal";
+
+            case "hiscore_oldschool_ironman":
+                return "Ironman";
+
+            case "hiscore_oldschool_hardcore_ironman":
+                return "Hardcore Ironman";
+
+            case "hiscore_oldschool_ultimate":
+                return "Ultimate Ironman";
+
+            case "hiscore_oldschool_seasonal":
+                return "Seasonal";
+
+            case "hiscore_oldschool_deadman":
+                return "Deadman";
+
+            case "hiscore_oldschool_tournament":
+                return "Tournament";
+
+            case "hiscore_oldschool_fresh_start":
+                return "Fresh Start";
+
+            default:
+                return endpoint.trim();
+        }
+    }
+
+private String deriveCurrentModeDisplay()
+{
+    Set<WorldType> worldTypes = client.getWorldType();
+    int accountType = client.getVarbitValue(Varbits.ACCOUNT_TYPE);
+
+    if (worldTypes != null)
+    {
+        if (worldTypes.contains(WorldType.SEASONAL))
+        {
+            return "Seasonal";
+        }
+        if (worldTypes.contains(WorldType.DEADMAN))
+        {
+            return "Deadman";
+        }
+        if (worldTypes.contains(WorldType.TOURNAMENT_WORLD))
+        {
+            return "Tournament";
+        }
+        if (worldTypes.contains(WorldType.FRESH_START_WORLD))
+        {
+            return "Fresh Start";
+        }
+    }
+
+    switch (accountType)
+    {
+        case 1:
+            return "Ironman";
+
+        case 2:
+            return "Ultimate Ironman";
+
+        case 3:
+            return "Hardcore Ironman";
+
+        case 4:
+            return "Group Ironman";
+
+        case 5:
+            return "Group Hardcore Ironman";
+
+        case 6:
+            return "Unranked Group Ironman";
+
+        default:
+            return "Normal";
+    }
+}
+
+    private CurrentProfileInfo getCurrentProfileInfo()
+    {
+        String playerName = getPlayerName();
+        String hiscoreCategory = deriveAutoHiscoreCategory();
+        String hiscoreCategoryDisplay = displayNameForHiscoreCategory(hiscoreCategory);
+        String modeDisplay = deriveCurrentModeDisplay();
+
+        return new CurrentProfileInfo(
+            playerName == null || playerName.trim().isEmpty() ? "-" : playerName.trim(),
+            hiscoreCategoryDisplay,
+            modeDisplay
+        );
+    }
+    private void refreshCurrentProfileInfoCache()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            cachedCurrentPlayerName = "-";
+            cachedCurrentHiscoreCategoryDisplay = "-";
+            cachedCurrentModeDisplay = "-";
+            return;
+        }
+
+        CurrentProfileInfo info = getCurrentProfileInfo();
+        cachedCurrentPlayerName = info.playerName;
+        cachedCurrentHiscoreCategoryDisplay = info.hiscoreCategoryDisplay;
+        cachedCurrentModeDisplay = info.modeDisplay;
+    }
+
+    private String trimmedOrNull(String value)
+    {
+        if (value == null)
+        {
+            return null;
+        }
+
+        String v = value.trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    private String resolveTargetPlayerFromMode()
+    {
+        if (config.apiOnly())
+        {
+            return trimmedOrNull(config.pinnedPlayer());
+        }
+
+        OsrsTrackerBridgeConfig.DisplayMode mode = config.displayMode();
+        if (mode == null)
+        {
+            mode = OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
+        }
+
+        switch (mode)
+        {
+            case FIXED_PROFILE:
+            case FIXED_PLAYER_AUTO_CATEGORY:
+                return trimmedOrNull(config.pinnedPlayer());
+
+            case FOLLOW_ACTIVE_SOURCE:
+                return getPlayerName();
+
+            default:
+                return trimmedOrNull(config.pinnedPlayer());
+        }
+    }
+
+    private String resolveTargetHiscoreCategoryFromMode()
+    {
+        if (config.apiOnly())
+        {
+            OsrsTrackerBridgeConfig.GameModeChoice choice = config.pinnedGameMode();
+            if (choice == null)
+            {
+                return "hiscore_oldschool";
+            }
             return choice.endpoint();
         }
 
-        return deriveAutoHiscoreCategory();
+        OsrsTrackerBridgeConfig.DisplayMode mode = config.displayMode();
+        if (mode == null)
+        {
+            mode = OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
+        }
+
+        switch (mode)
+        {
+            case FIXED_PROFILE:
+            {
+                OsrsTrackerBridgeConfig.GameModeChoice choice = config.pinnedGameMode();
+                if (choice == null)
+                {
+                    return "hiscore_oldschool";
+                }
+                return choice.endpoint();
+            }
+
+            case FIXED_PLAYER_AUTO_CATEGORY:
+            case FOLLOW_ACTIVE_SOURCE:
+                return deriveAutoHiscoreCategory();
+
+            default:
+                return deriveAutoHiscoreCategory();
+        }
     }
 
-    private void refreshIdentityDisplay()
+    private String resolveTargetGameModeFromMode()
     {
-        String player = resolveEffectivePlayerName();
-        String category = resolveEffectiveHiscoreCategory();
+        if (config.apiOnly())
+        {
+            OsrsTrackerBridgeConfig.GameModeChoice choice = config.pinnedGameMode();
+            return choice == null ? "normal" : choice.gameModeKey();
+        }
 
-        updateCurrentConfigDisplay(player, category);
+        OsrsTrackerBridgeConfig.DisplayMode mode = config.displayMode();
+        if (mode == null)
+        {
+            mode = OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY;
+        }
+
+        switch (mode)
+        {
+            case FIXED_PROFILE:
+            {
+                OsrsTrackerBridgeConfig.GameModeChoice choice = config.pinnedGameMode();
+                return choice == null ? "normal" : choice.gameModeKey();
+            }
+
+            case FIXED_PLAYER_AUTO_CATEGORY:
+            case FOLLOW_ACTIVE_SOURCE:
+                return deriveDeviceGameMode();
+
+            default:
+                return deriveDeviceGameMode();
+        }
+    }
+
+        private OsrsTrackerBridgeConfig.GameModeChoice mapGameModeKeyToChoice(String gameModeKey)
+    {
+        if (gameModeKey == null || gameModeKey.trim().isEmpty())
+        {
+            return OsrsTrackerBridgeConfig.GameModeChoice.NORMAL;
+        }
+
+        for (OsrsTrackerBridgeConfig.GameModeChoice choice
+            : OsrsTrackerBridgeConfig.GameModeChoice.values())
+        {
+            if (gameModeKey.equals(choice.gameModeKey()))
+            {
+                return choice;
+            }
+        }
+
+        return OsrsTrackerBridgeConfig.GameModeChoice.NORMAL;
+    }
+
+    private String endpointToDeviceGameMode(String endpoint)
+    {
+        if (endpoint == null || endpoint.trim().isEmpty())
+        {
+            return "normal";
+        }
+
+        switch (endpoint.trim())
+        {
+            case "hiscore_oldschool":
+                return "normal";
+            case "hiscore_oldschool_ironman":
+                return "ironman";
+            case "hiscore_oldschool_hardcore_ironman":
+                return "hc_ironman";
+            case "hiscore_oldschool_ultimate":
+                return "u_ironman";
+            case "hiscore_oldschool_seasonal":
+                return "league";
+            case "hiscore_oldschool_deadman":
+                return "deadman";
+            case "hiscore_oldschool_tournament":
+                return "tournament";
+            case "hiscore_oldschool_fresh_start":
+                return "fresh_start";
+            default:
+                return "normal";
+        }
+    }
+
+    private void refreshTargetDisplay()
+    {
+        String player = resolveTargetPlayerFromMode();
+        String category = resolveTargetHiscoreCategoryFromMode();
+
+        log.info(
+            "refreshTargetDisplay -> mode={} apiOnly={} loggedIn={} resolvedPlayer={} resolvedCategory={} worldTypes={}",
+            config.displayMode(),
+            config.apiOnly(),
+            getPlayerName(),
+            player,
+            category,
+            client.getWorldType()
+        );
+
+        updateTargetDisplay(player, category);
     }
 
     private static final class DeviceStatusResponse
     {
+        String displayMode;
+        String pinnedPlayer;
+        String pinnedGameMode;
+        String pinnedHiscoreCategory;
+        Boolean apiOnly;
+
         String targetPlayer;
+        String targetGameMode;
         String targetHiscoreCategory;
+
+        String visiblePlayer;
+        String visibleGameMode;
+        String visibleHiscoreCategory;
+
+        Boolean pluginHeartbeatFresh;
+        Boolean pluginDisplayAllowed;
+
+        String liveOwnerPlayer;
+        String liveOwnerGameMode;
+        String liveOwnerHiscoreCategory;
+    }
+
+    private static final class CurrentProfileInfo
+    {
+        final String playerName;
+        final String hiscoreCategoryDisplay;
+        final String modeDisplay;
+
+        CurrentProfileInfo(String playerName, String hiscoreCategoryDisplay, String modeDisplay)
+        {
+            this.playerName = playerName;
+            this.hiscoreCategoryDisplay = hiscoreCategoryDisplay;
+            this.modeDisplay = modeDisplay;
+        }
     }
 
     private String normalizePlayerForMatch(String s)
@@ -1262,18 +2054,343 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         cachedDeviceTargetPlayer = (player == null || player.trim().isEmpty()) ? null : player.trim();
         cachedDeviceTargetCategory = (category == null || category.trim().isEmpty()) ? null : category.trim();
     }
+    private void setOptimisticDeviceConfigCache(
+    String displayMode,
+    String pinnedPlayer,
+    String pinnedGameMode,
+    String pinnedCategory,
+    boolean apiOnly,
+    String targetPlayer,
+    String targetGameMode,
+    String targetCategory)
+    {
+        cachedDeviceDisplayMode =
+            (displayMode == null || displayMode.trim().isEmpty()) ? null : displayMode.trim();
+
+        cachedDevicePinnedPlayer =
+            (pinnedPlayer == null || pinnedPlayer.trim().isEmpty()) ? null : pinnedPlayer.trim();
+
+        cachedDevicePinnedGameMode =
+            (pinnedGameMode == null || pinnedGameMode.trim().isEmpty()) ? null : pinnedGameMode.trim();
+
+        cachedDevicePinnedCategory =
+            (pinnedCategory == null || pinnedCategory.trim().isEmpty()) ? null : pinnedCategory.trim();
+
+        cachedDeviceApiOnly = apiOnly;
+
+        cachedDeviceTargetPlayer =
+            (targetPlayer == null || targetPlayer.trim().isEmpty()) ? null : targetPlayer.trim();
+
+        cachedDeviceTargetGameMode =
+            (targetGameMode == null || targetGameMode.trim().isEmpty()) ? null : targetGameMode.trim();
+
+        cachedDeviceTargetCategory =
+            (targetCategory == null || targetCategory.trim().isEmpty()) ? null : targetCategory.trim();
+
+        lastDeviceSettingsSnapshot = buildDeviceSettingsSnapshot();
+        refreshDeviceStatusPanelFromAnyThread(true);
+    }
+
+    private String buildDeviceSettingsSnapshot()
+    {
+        return String.valueOf(cachedDeviceDisplayMode) + "\n"
+            + String.valueOf(cachedDevicePinnedPlayer) + "\n"
+            + String.valueOf(cachedDevicePinnedGameMode) + "\n"
+            + String.valueOf(cachedDevicePinnedCategory) + "\n"
+            + String.valueOf(cachedDeviceApiOnly) + "\n"
+            + String.valueOf(cachedDeviceTargetPlayer) + "\n"
+            + String.valueOf(cachedDeviceTargetGameMode) + "\n"
+            + String.valueOf(cachedDeviceTargetCategory);
+    }
+
+
+    private void refreshDeviceStatusPanelFromAnyThread(boolean applyControls)
+    {
+        if (sidePanel == null)
+        {
+            return;
+        }
+
+        clientThread.invokeLater(() ->
+        {
+            refreshCurrentProfileInfoCache();
+
+            javax.swing.SwingUtilities.invokeLater(() ->
+            {
+                if (sidePanel != null)
+                {
+                    sidePanel.refreshDeviceStatusBlock();
+                }
+            });
+        });
+    }
+
+
+    private void setCachedDeviceStatus(DeviceStatusResponse status)
+    {
+        if (status == null)
+        {
+            return;
+        }
+
+        cachedDeviceDisplayMode =
+            (status.displayMode == null || status.displayMode.trim().isEmpty())
+                ? null
+                : status.displayMode.trim();
+
+        cachedDevicePinnedPlayer =
+            (status.pinnedPlayer == null || status.pinnedPlayer.trim().isEmpty())
+                ? null
+                : status.pinnedPlayer.trim();
+
+        cachedDevicePinnedGameMode =
+            (status.pinnedGameMode == null || status.pinnedGameMode.trim().isEmpty())
+                ? null
+                : status.pinnedGameMode.trim();
+
+        cachedDevicePinnedCategory =
+            (status.pinnedHiscoreCategory == null || status.pinnedHiscoreCategory.trim().isEmpty())
+                ? null
+                : status.pinnedHiscoreCategory.trim();
+
+        cachedDeviceApiOnly = status.apiOnly;
+
+        cachedDeviceTargetPlayer =
+            (status.targetPlayer == null || status.targetPlayer.trim().isEmpty())
+                ? null
+                : status.targetPlayer.trim();
+
+        cachedDeviceTargetGameMode =
+            (status.targetGameMode == null || status.targetGameMode.trim().isEmpty())
+                ? null
+                : status.targetGameMode.trim();
+
+        cachedDeviceTargetCategory =
+            (status.targetHiscoreCategory == null || status.targetHiscoreCategory.trim().isEmpty())
+                ? null
+                : status.targetHiscoreCategory.trim();
+
+        cachedDeviceVisiblePlayer =
+            (status.visiblePlayer == null || status.visiblePlayer.trim().isEmpty())
+                ? null
+                : status.visiblePlayer.trim();
+
+        cachedDeviceVisibleGameMode =
+            (status.visibleGameMode == null || status.visibleGameMode.trim().isEmpty())
+                ? null
+                : status.visibleGameMode.trim();
+
+        cachedDeviceVisibleCategory =
+            (status.visibleHiscoreCategory == null || status.visibleHiscoreCategory.trim().isEmpty())
+                ? null
+                : status.visibleHiscoreCategory.trim();
+
+        cachedDevicePluginHeartbeatFresh = status.pluginHeartbeatFresh;
+        cachedDevicePluginDisplayAllowed = status.pluginDisplayAllowed;
+
+        cachedDeviceLiveOwnerPlayer =
+            (status.liveOwnerPlayer == null || status.liveOwnerPlayer.trim().isEmpty())
+                ? null
+                : status.liveOwnerPlayer.trim();
+
+        cachedDeviceLiveOwnerGameMode =
+            (status.liveOwnerGameMode == null || status.liveOwnerGameMode.trim().isEmpty())
+                ? null
+                : status.liveOwnerGameMode.trim();
+
+        cachedDeviceLiveOwnerCategory =
+            (status.liveOwnerHiscoreCategory == null || status.liveOwnerHiscoreCategory.trim().isEmpty())
+                ? null
+                : status.liveOwnerHiscoreCategory.trim();
+
+        log.info("DEVICE STATUS cached: mode='{}' apiOnly={} targetPlayer='{}' targetCategory='{}' visiblePlayer='{}' visibleCategory='{}' heartbeatFresh={} pluginDisplayAllowed={} pinnedPlayer='{}' pinnedCategory='{}'",
+    cachedDeviceDisplayMode,
+    cachedDeviceApiOnly,
+    cachedDeviceTargetPlayer,
+    cachedDeviceTargetCategory,
+    cachedDeviceVisiblePlayer,
+    cachedDeviceVisibleCategory,
+    cachedDevicePluginHeartbeatFresh,
+    cachedDevicePluginDisplayAllowed,
+    cachedDevicePinnedPlayer,
+    cachedDevicePinnedCategory);
+
+
+    maybeBootstrapFollowActiveOwnership();
+
+    String newSnapshot = buildDeviceSettingsSnapshot();
+    boolean applyControls = !java.util.Objects.equals(lastDeviceSettingsSnapshot, newSnapshot);
+
+    if (applyControls)
+    {
+        lastDeviceSettingsSnapshot = newSnapshot;
+    }
+
+    refreshDeviceStatusPanelFromAnyThread(applyControls);
+    }
+
+        private void maybeBootstrapFollowActiveOwnership()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            followBootstrapSentForCurrentOwnership = false;
+            return;
+        }
+
+        if (Boolean.TRUE.equals(cachedDeviceApiOnly))
+        {
+            followBootstrapSentForCurrentOwnership = false;
+            return;
+        }
+
+        if (!"FOLLOW_ACTIVE_SOURCE".equals(cachedDeviceDisplayMode))
+        {
+            followBootstrapSentForCurrentOwnership = false;
+            return;
+        }
+
+        String loggedIn = getPushPlayer();
+        if (loggedIn == null || loggedIn.trim().isEmpty())
+        {
+            followBootstrapSentForCurrentOwnership = false;
+            return;
+        }
+
+        String owner = cachedDeviceLiveOwnerPlayer;
+        boolean iOwnDeviceNow =
+            owner != null
+                && normalizePlayerForMatch(loggedIn).equals(normalizePlayerForMatch(owner))
+                && Boolean.TRUE.equals(cachedDevicePluginHeartbeatFresh)
+                && Boolean.TRUE.equals(cachedDevicePluginDisplayAllowed);
+
+        if (!iOwnDeviceNow)
+        {
+            followBootstrapSentForCurrentOwnership = false;
+            return;
+        }
+
+        if (followBootstrapSentForCurrentOwnership)
+        {
+            return;
+        }
+
+        followBootstrapSentForCurrentOwnership = true;
+
+        log.info("FOLLOW bootstrap starting for new ownership. loggedIn='{}' owner='{}'", loggedIn, owner);
+        clientThread.invokeLater(() ->
+        {
+            if (client.getGameState() != GameState.LOGGED_IN)
+            {
+                return;
+            }
+
+            if (!canSendLiveForCurrentLogin())
+            {
+                return;
+            }
+
+            log.info("FOLLOW bootstrap heartbeat queued for '{}'", loggedIn);
+            enqueueImmediateHeartbeatNow();
+
+            log.info("FOLLOW bootstrap snapshot queued for '{}'", loggedIn);
+            enqueueSnapshotNow("follow-takeover");
+
+            log.info("FOLLOW bootstrap bank queued for '{}'", loggedIn);
+            enqueueLastKnownBankNow();
+        });
+    }
 
     private boolean canSendLiveForCurrentLogin()
     {
         String loggedIn = getPushPlayer();
-        String target = cachedDeviceTargetPlayer;
-
-        if (loggedIn == null || target == null)
+        if (loggedIn == null)
         {
+            log.info("LIVE GATE -> false: loggedIn is null");
             return false;
         }
 
-        return normalizePlayerForMatch(loggedIn).equals(normalizePlayerForMatch(target));
+        if (Boolean.TRUE.equals(cachedDeviceApiOnly))
+        {
+            log.info("LIVE GATE -> false: apiOnly=true loggedIn='{}'", loggedIn);
+            return false;
+        }
+
+        String mode = cachedDeviceDisplayMode;
+        String normalizedLoggedIn = normalizePlayerForMatch(loggedIn);
+
+        if ("FIXED_PROFILE".equals(mode))
+        {
+            String pinned = cachedDevicePinnedPlayer;
+            if (pinned == null)
+            {
+                log.info("LIVE GATE -> false: mode='{}' pinnedPlayer is null loggedIn='{}'",
+                    mode, loggedIn);
+                return false;
+            }
+
+            boolean allowed = normalizedLoggedIn.equals(normalizePlayerForMatch(pinned));
+            log.info("LIVE GATE -> {}: mode='{}' loggedIn='{}' pinned='{}'",
+                allowed, mode, loggedIn, pinned);
+            return allowed;
+        }
+
+        if ("FIXED_PLAYER_AUTO_CATEGORY".equals(mode))
+        {
+            String target = cachedDeviceTargetPlayer;
+            if (target == null)
+            {
+                log.info("LIVE GATE -> false: mode='{}' targetPlayer is null loggedIn='{}'",
+                    mode, loggedIn);
+                return false;
+            }
+
+            boolean allowed = normalizedLoggedIn.equals(normalizePlayerForMatch(target));
+            log.info("LIVE GATE -> {}: mode='{}' loggedIn='{}' target='{}'",
+                allowed, mode, loggedIn, target);
+            return allowed;
+        }
+
+        if ("FOLLOW_ACTIVE_SOURCE".equals(mode))
+        {
+            if (Boolean.TRUE.equals(cachedDevicePluginHeartbeatFresh))
+            {
+                String target = cachedDeviceTargetPlayer;
+                if (target == null)
+                {
+                    log.info("LIVE GATE -> false: mode='{}' heartbeatFresh=true but target is null loggedIn='{}'",
+                        mode, loggedIn);
+                    return false;
+                }
+
+                boolean allowed = normalizedLoggedIn.equals(normalizePlayerForMatch(target));
+                log.info("LIVE GATE -> {}: mode='{}' heartbeatFresh=true pluginDisplayAllowed={} loggedIn='{}' target='{}' visiblePlayer='{}' visibleCategory='{}'",
+                    allowed,
+                    mode,
+                    cachedDevicePluginDisplayAllowed,
+                    loggedIn,
+                    target,
+                    cachedDeviceVisiblePlayer,
+                    cachedDeviceVisibleCategory);
+                return allowed;
+            }
+
+            log.info("LIVE GATE -> true: mode='{}' heartbeatFresh=false loggedIn='{}' target='{}'",
+                mode, loggedIn, cachedDeviceTargetPlayer);
+            return true;
+        }
+
+        String target = cachedDeviceTargetPlayer;
+        if (target == null)
+        {
+            log.info("LIVE GATE -> false: fallback mode='{}' target is null loggedIn='{}'",
+                mode, loggedIn);
+            return false;
+        }
+
+        boolean allowed = normalizedLoggedIn.equals(normalizePlayerForMatch(target));
+        log.info("LIVE GATE -> {}: fallback mode='{}' loggedIn='{}' target='{}'",
+            allowed, mode, loggedIn, target);
+        return allowed;
     }
 
     private void startDeviceStatusTicker()
@@ -1312,7 +2429,7 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
             @Override
             public void onFailure(Call call, IOException ex)
             {
-                log.debug("ESP32 status poll failed: {}", ex.toString());
+                log.info("ESP32 status poll failed: {}", ex.toString());
             }
 
             @Override
@@ -1322,7 +2439,7 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
                 {
                     if (!r.isSuccessful() || r.body() == null)
                     {
-                        log.debug("ESP32 status poll HTTP {}", r.code());
+                        log.info("ESP32 status poll HTTP {}", r.code());
                         return;
                     }
 
@@ -1333,17 +2450,17 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
                         return;
                     }
 
-                    setCachedDeviceTarget(status.targetPlayer, status.targetHiscoreCategory);
+                    setCachedDeviceStatus(status);
                 }
             }
         });
     }
 
-    private void scheduleIdentityRefreshAndConfigSync(boolean sendConfig)
+    private void scheduleTargetRefreshAndConfigSync(boolean sendConfig)
     {
         clientThread.invokeLater(() ->
         {
-            refreshIdentityDisplay();
+            refreshTargetDisplay();
             if (sendConfig)
             {
                 pushConfigNowValidated();
@@ -1351,126 +2468,378 @@ public class ScreenOfKnowledgeBridgePlugin extends Plugin
         });
     }
 
-private static final Pattern OSRS_NAME_PATTERN = Pattern.compile("^[A-Za-z0-9 _-]{1,12}$");
-
-private boolean isValidPlayerNameLocal(String name)
-{
-    if (name == null) return false;
-    String n = name.trim();
-    if (n.isEmpty()) return false;
-    return OSRS_NAME_PATTERN.matcher(n).matches();
-}
-
-private boolean isValidCategoryLocal(String category)
-{
-    if (category == null) return false;
-    String c = category.trim();
-    return !c.isEmpty();
-}
-
-private HttpUrl buildHiscoresLiteUrl(String categoryEndpoint, String player)
-{
-    // https://secure.runescape.com/m=<category>/index_lite.ws?player=<name>
-    // categoryEndpoint examples: hiscore_oldschool, hiscore_oldschool_ironman, etc.
-    try
+    private void scheduleDelayedAutoSourceAnnounce(long delayMs)
     {
-        return new HttpUrl.Builder()
-            .scheme("https")
-            .host("secure.runescape.com")
-            .addPathSegment("m=" + categoryEndpoint)
-            .addPathSegment("index_lite.ws")
-            .addQueryParameter("player", player)
-            .build();
-    }
-    catch (IllegalArgumentException ex)
-    {
-        log.debug("Invalid hiscores URL build: cat='{}' player='{}' err={}", categoryEndpoint, player, ex.toString());
-        return null;
-    }
-}
-
-private void pushConfigNowValidated()
-{
-    // Must be called from client thread OR after you’ve resolved values safely.
-    final String player = resolveEffectivePlayerName();
-    final String category = resolveEffectiveHiscoreCategory();
-    updateCurrentConfigDisplay(player, category);
-
-    final HttpUrl deviceUrl = buildUrl("push");
-
-    if (deviceUrl == null)
-    {
-        log.debug("Config push blocked: device URL invalid.");
-        uiSetPanelStatus("Push blocked: invalid device URL.");
-        return;
-    }
-    if (!isValidPlayerNameLocal(player))
-    {
-        log.debug("Config push blocked: invalid player name '{}'", player);
-        uiSetPanelStatus("Push blocked: invalid player name.");
-        return;
-    }
-
-    if (!isValidCategoryLocal(category))
-    {
-        log.debug("Config push blocked: invalid hiscore category '{}'", category);
-        uiSetPanelStatus("Push blocked: invalid hiscore category.");
-        return;
-    }
-
-    // Online validation (hiscores endpoint) off-thread
-    final HttpUrl hiscoresUrl = buildHiscoresLiteUrl(category.trim(), player.trim());
-    if (hiscoresUrl == null)
-    {
-        log.debug("Config push blocked: cannot build hiscores validation URL.");
-        uiSetPanelStatus("Push blocked: validation URL error.");
-        return;
-    }
-    executor.execute(() ->
-    {
-        Request req = new Request.Builder().url(hiscoresUrl).get().build();
-
-        try (Response resp = http.newCall(req).execute())
+        executor.schedule(() -> clientThread.invokeLater(() ->
         {
-            int code = resp.code();
-
-            // Treat 200 as "player+category exists". Anything else blocks send.
-            if (code < 200 || code >= 300)
+            if (client.getGameState() != GameState.LOGGED_IN)
             {
-                log.debug("Config push blocked: hiscores validation failed HTTP {} (player='{}' cat='{}')",
-                    code, player, category);
-                uiSetPanelStatus("Push blocked: player/category not valid (HTTP " + code + ").");
                 return;
             }
-        }
-        catch (IOException ex)
+
+            refreshTargetDisplay();
+
+            OsrsTrackerBridgeConfig.DisplayMode mode = config.displayMode();
+            if (mode == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY
+                || mode == OsrsTrackerBridgeConfig.DisplayMode.FOLLOW_ACTIVE_SOURCE)
+            {
+                enqueueSourceAnnounceNow();
+            }
+        }), delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private static final Pattern OSRS_NAME_PATTERN = Pattern.compile("^[A-Za-z0-9 _-]{1,12}$");
+
+    private boolean isValidPlayerNameLocal(String name)
+    {
+        if (name == null) return false;
+        String n = name.trim();
+        if (n.isEmpty()) return false;
+        return OSRS_NAME_PATTERN.matcher(n).matches();
+    }
+
+    private boolean isValidCategoryLocal(String category)
+    {
+        if (category == null) return false;
+        String c = category.trim();
+        return !c.isEmpty();
+    }
+
+    private String resolveFixedPlayerAutoCategoryForConfigPush(String targetPlayer)
+    {
+        if (targetPlayer == null || targetPlayer.trim().isEmpty())
         {
-            log.debug("Config push blocked: hiscores validation IO error (player='{}' cat='{}') err={}",
-                player, category, ex.toString());
-            uiSetPanelStatus("Push blocked: validation request failed.");
+            return null;
+        }
+
+        String loggedIn = getPushPlayer();
+        String trimmedTarget = targetPlayer.trim();
+
+        if (loggedIn != null
+            && normalizePlayerForMatch(loggedIn).equals(normalizePlayerForMatch(trimmedTarget)))
+        {
+            String derived = deriveAutoHiscoreCategory();
+            log.info("AUTO CAT using logged-in player category: player='{}' category='{}'",
+                trimmedTarget, derived);
+            return derived;
+        }
+
+        String detected = detectHiscoreCategoryForPlayer(trimmedTarget);
+        log.info("AUTO CAT detected by probing: player='{}' category='{}'",
+            trimmedTarget, detected);
+
+        return detected;
+    }
+
+        private String resolveFixedPlayerAutoCategoryForConfigPushUsingSnapshot(
+            String targetPlayer,
+            String loggedInPlayerSnapshot,
+            String loggedInAutoCategorySnapshot)
+        {
+            if (targetPlayer == null || targetPlayer.trim().isEmpty())
+            {
+                return null;
+            }
+
+            String trimmedTarget = targetPlayer.trim();
+
+            if (loggedInPlayerSnapshot != null
+                && normalizePlayerForMatch(loggedInPlayerSnapshot).equals(normalizePlayerForMatch(trimmedTarget)))
+            {
+                log.info("AUTO CAT using logged-in player category snapshot: player='{}' category='{}'",
+                    trimmedTarget, loggedInAutoCategorySnapshot);
+                return loggedInAutoCategorySnapshot;
+            }
+
+            String detected = detectHiscoreCategoryForPlayer(trimmedTarget);
+            log.info("AUTO CAT detected by probing: player='{}' category='{}'",
+                trimmedTarget, detected);
+
+            return detected;
+        }
+
+    private String detectHiscoreCategoryForPlayer(String player)
+    {
+        if (player == null || player.trim().isEmpty())
+        {
+            return null;
+        }
+
+        String trimmedPlayer = player.trim();
+
+        for (String category : FIXED_PLAYER_AUTO_CATEGORY_PROBE_ORDER)
+        {
+            HttpUrl url = buildHiscoresLiteUrl(category, trimmedPlayer);
+            if (url == null)
+            {
+                continue;
+            }
+
+            Request req = new Request.Builder().url(url).get().build();
+
+            try (Response resp = http.newCall(req).execute())
+            {
+                int code = resp.code();
+                log.info("AUTO CAT probe: player='{}' category='{}' http={}", trimmedPlayer, category, code);
+
+                if (code >= 200 && code < 300)
+                {
+                    return category;
+                }
+            }
+            catch (IOException ex)
+            {
+                log.info("AUTO CAT probe failed: player='{}' category='{}' err={}",
+                    trimmedPlayer, category, ex.toString());
+            }
+        }
+
+        return null;
+    }
+
+    private HttpUrl buildHiscoresLiteUrl(String categoryEndpoint, String player)
+    {
+        // Target format:
+        // https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=<name>
+        try
+        {
+            String encodedPath = "/m=" + categoryEndpoint + "/index_lite.ws";
+
+            return new HttpUrl.Builder()
+                .scheme("https")
+                .host("secure.runescape.com")
+                .encodedPath(encodedPath)
+                .addQueryParameter("player", player)
+                .build();
+        }
+        catch (IllegalArgumentException ex)
+        {
+            log.info("Invalid hiscores URL build: cat='{}' player='{}' err={}", categoryEndpoint, player, ex.toString());
+            return null;
+        }
+    }
+
+    private void pushConfigNowValidated()
+    {
+        final String player = resolveTargetPlayerFromMode();
+        final HttpUrl deviceUrl = buildUrl("push");
+
+        if (deviceUrl == null)
+        {
+            log.info("Config push blocked: device URL invalid.");
+            uiSetPanelStatus("Push blocked: invalid device URL.");
             return;
         }
 
-        // Valid -> push target config to device
-        PushPayload p = PushPayload.configUpdate(player, nextSeq(), player, category);
-        enqueue(PendingKind.CONFIG, deviceUrl, p);
-        uiSetPanelStatus("Push queued for " + player + " / " + category);
-
-        // Optimistically cache the device target so live gating can react quickly.
-        setCachedDeviceTarget(player, category);
-
-        // Only send live data immediately if this RuneLite instance is actually logged into
-        // the same player that was just set as the device target.
-        if (canSendLiveForCurrentLogin())
+        if (!isValidPlayerNameLocal(player))
         {
-            clientThread.invokeLater(() ->
-            {
-                enqueueSnapshotNow("config-push");
-                enqueueLastKnownBankNow();
-            });
+            log.info("Config push blocked: invalid player name '{}'", player);
+            uiSetPanelStatus("Push blocked: invalid player name.");
+            return;
         }
-    });
-}
+
+        uiSetPanelStatus("Validating player/category...");
+
+        final OsrsTrackerBridgeConfig.DisplayMode mode =
+            config.displayMode() == null
+                ? OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY
+                : config.displayMode();
+
+        final boolean apiOnly = config.apiOnly();
+        final String displayMode = mode.name();
+        final String pinnedPlayer = config.pinnedPlayer() == null ? "" : config.pinnedPlayer().trim();
+
+        OsrsTrackerBridgeConfig.GameModeChoice pinnedChoice = config.pinnedGameMode();
+        if (pinnedChoice == null)
+        {
+            pinnedChoice = OsrsTrackerBridgeConfig.GameModeChoice.NORMAL;
+        }
+        final String pinnedGameMode = pinnedChoice.gameModeKey();
+        final String pinnedCategory = pinnedChoice.endpoint();
+
+        final String loggedInPlayerSnapshot = getPushPlayer();
+        final String loggedInAutoCategorySnapshot = deriveAutoHiscoreCategory();
+        final Set<WorldType> loggedInWorldTypesSnapshot = client.getWorldType();
+        final int loggedInAccountTypeSnapshot = client.getVarbitValue(Varbits.ACCOUNT_TYPE);
+        final String loggedInDeviceGameModeSnapshot =
+            deriveDeviceGameModeFromSnapshot(loggedInWorldTypesSnapshot, loggedInAccountTypeSnapshot);
+
+        executor.execute(() ->
+        {
+            String category;
+
+            if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY)
+            {
+                category = resolveFixedPlayerAutoCategoryForConfigPushUsingSnapshot(
+                    player,
+                    loggedInPlayerSnapshot,
+                    loggedInAutoCategorySnapshot
+                );
+            }
+            else if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FOLLOW_ACTIVE_SOURCE)
+            {
+                category = loggedInAutoCategorySnapshot;
+            }
+            else if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PROFILE)
+            {
+                category = pinnedCategory;
+            }
+            else if (apiOnly)
+            {
+                category = pinnedCategory;
+            }
+            else
+            {
+                category = loggedInAutoCategorySnapshot;
+            }
+
+            updateTargetDisplay(player, category);
+
+            final String gameMode;
+
+            if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PLAYER_AUTO_CATEGORY)
+            {
+                if (loggedInPlayerSnapshot != null
+                    && normalizePlayerForMatch(loggedInPlayerSnapshot).equals(normalizePlayerForMatch(player)))
+                {
+                    gameMode = loggedInDeviceGameModeSnapshot;
+                }
+                else
+                {
+                    gameMode = endpointToDeviceGameMode(category);
+                }
+            }
+            else if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FOLLOW_ACTIVE_SOURCE)
+            {
+                gameMode = loggedInDeviceGameModeSnapshot;
+            }
+            else if (!apiOnly && mode == OsrsTrackerBridgeConfig.DisplayMode.FIXED_PROFILE)
+            {
+                gameMode = pinnedGameMode;
+            }
+            else if (apiOnly)
+            {
+                gameMode = endpointToDeviceGameMode(category);
+            }
+            else
+            {
+                gameMode = loggedInDeviceGameModeSnapshot;
+            }
+
+            if (category == null || category.trim().isEmpty())
+            {
+                log.info("Config push blocked: could not detect hiscore category for player '{}'", player);
+                uiSetPanelStatus("Push blocked: could not detect player category.");
+                return;
+            }
+
+            if (!isValidCategoryLocal(category))
+            {
+                log.info("Config push blocked: invalid hiscore category '{}'", category);
+                uiSetPanelStatus("Push blocked: invalid hiscore category.");
+                return;
+            }
+
+            final HttpUrl hiscoresUrl = buildHiscoresLiteUrl(category.trim(), player.trim());
+            if (hiscoresUrl == null)
+            {
+                log.info("Config push blocked: cannot build hiscores validation URL.");
+                uiSetPanelStatus("Push blocked: validation URL error.");
+                return;
+            }
+
+            Request req = new Request.Builder().url(hiscoresUrl).get().build();
+
+            try (Response resp = http.newCall(req).execute())
+            {
+                int code = resp.code();
+
+                if (code < 200 || code >= 300)
+                {
+                    log.info("Config push blocked: hiscores validation failed HTTP {} (player='{}' cat='{}')",
+                        code, player, category);
+                    uiSetPanelStatus("Push blocked: player/category not valid (HTTP " + code + ").");
+                    return;
+                }
+            }
+            catch (IOException ex)
+            {
+                log.info("Config push blocked: hiscores validation IO error (player='{}' cat='{}') err={}",
+                    player, category, ex.toString());
+                uiSetPanelStatus("Push blocked: validation request failed.");
+                return;
+            }
+
+            PushPayload p = PushPayload.configUpdate(
+                player,
+                nextSeq(),
+                player,
+                category,
+                gameMode,
+                displayMode,
+                pinnedPlayer,
+                pinnedGameMode,
+                pinnedCategory,
+                apiOnly
+            );
+            enqueue(PendingKind.CONFIG, deviceUrl, p);
+            log.info("CONFIG push queued: player='{}' category='{}'", player, category);
+            uiSetPanelStatus("Push queued for " + player + " / " + category);
+
+            setOptimisticDeviceConfigCache(
+                displayMode,
+                pinnedPlayer,
+                pinnedGameMode,
+                pinnedCategory,
+                apiOnly,
+                player,
+                gameMode,
+                category
+            );
+
+            log.info("CONFIG cache updated: mode='{}' apiOnly={} player='{}' category='{}' pinnedPlayer='{}' pinnedCategory='{}'",
+                displayMode,
+                apiOnly,
+                player,
+                category,
+                pinnedPlayer,
+                pinnedCategory);
+
+            boolean targetIsLoggedIn =
+                loggedInPlayerSnapshot != null
+                    && normalizePlayerForMatch(loggedInPlayerSnapshot).equals(normalizePlayerForMatch(player));
+
+            if (targetIsLoggedIn && !apiOnly)
+            {
+                log.info("CONFIG bootstrap starting. loggedIn='{}' target='{}' mode='{}' category='{}'",
+                    loggedInPlayerSnapshot,
+                    player,
+                    displayMode,
+                    category);
+
+                clientThread.invokeLater(() ->
+                {
+                    log.info("BOOTSTRAP heartbeat queued for '{}'", player);
+                    enqueueImmediateHeartbeatNow();
+
+                    log.info("BOOTSTRAP snapshot queued for '{}' reason='config-push'", player);
+                    enqueueSnapshotNow("config-push");
+
+                    log.info("BOOTSTRAP bank queued for '{}'", player);
+                    enqueueLastKnownBankNow();
+                });
+            }
+            else
+            {
+                log.info("CONFIG bootstrap skipped. loggedIn='{}' target='{}' targetIsLoggedIn={} apiOnly={} mode='{}'",
+                    loggedInPlayerSnapshot,
+                    player,
+                    targetIsLoggedIn,
+                    apiOnly,
+                    displayMode);
+            }
+        });
+    }
 
     private void seedLastLevelsFromClient()
     {
@@ -1554,7 +2923,7 @@ private void pushConfigNowValidated()
         }
         catch (IllegalArgumentException ex)
         {
-            log.debug("Invalid deviceHost '{}': {}", hostRaw, ex.toString());
+            log.info("Invalid deviceHost '{}': {}", hostRaw, ex.toString());
             return null;
         }
     }
@@ -1572,23 +2941,23 @@ private void pushConfigNowValidated()
         }
     }
 
-    private String normalizePlayerForBankKey(String player)
+    private String normalizePartForBankKey(String value)
     {
-        if (player == null)
+        if (value == null)
         {
             return null;
         }
 
-        String p = player.trim();
-        if (p.isEmpty())
+        String v = value.trim();
+        if (v.isEmpty())
         {
             return null;
         }
 
-        StringBuilder out = new StringBuilder(p.length() * 3);
-        for (int i = 0; i < p.length(); i++)
+        StringBuilder out = new StringBuilder(v.length() * 3);
+        for (int i = 0; i < v.length(); i++)
         {
-            char c = p.charAt(i);
+            char c = v.charAt(i);
 
             boolean safe =
                 (c >= 'A' && c <= 'Z')
@@ -1617,26 +2986,47 @@ private void pushConfigNowValidated()
         return out.toString();
     }
 
-    private void saveLastKnownBankTotalForPlayer(String player, long total)
+    private String makeBankCacheKey(String player, String hiscoreCategory)
     {
-        String keySuffix = normalizePlayerForBankKey(player);
+        String p = normalizePartForBankKey(player);
+        String c = normalizePartForBankKey(hiscoreCategory);
+
+        if (p == null || c == null)
+        {
+            return null;
+        }
+
+        return p + BANK_KEY_SEP + c;
+    }
+
+    private void saveLastKnownBankTotalForProfile(String player, String hiscoreCategory, long total)
+    {
+        String keySuffix = makeBankCacheKey(player, hiscoreCategory);
         if (keySuffix == null)
         {
             return;
         }
 
-        configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_LAST_BANK_TOTAL_PREFIX + keySuffix, Long.toString(total));
+        configManager.setConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_LAST_BANK_TOTAL_PREFIX + keySuffix,
+            Long.toString(total)
+        );
     }
 
-    private Long loadLastKnownBankTotalForPlayer(String player)
+    private Long loadLastKnownBankTotalForProfile(String player, String hiscoreCategory)
     {
-        String keySuffix = normalizePlayerForBankKey(player);
+        String keySuffix = makeBankCacheKey(player, hiscoreCategory);
         if (keySuffix == null)
         {
             return null;
         }
 
-        String raw = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY_LAST_BANK_TOTAL_PREFIX + keySuffix);
+        String raw = configManager.getConfiguration(
+            CONFIG_GROUP,
+            CONFIG_KEY_LAST_BANK_TOTAL_PREFIX + keySuffix
+        );
+
         if (raw == null || raw.trim().isEmpty())
         {
             return null;
@@ -1648,7 +3038,7 @@ private void pushConfigNowValidated()
         }
         catch (NumberFormatException ex)
         {
-            log.debug("Invalid saved bank total for player '{}': {}", player, raw);
+            log.info("Invalid saved bank total for player '{}' category '{}': {}", player, hiscoreCategory, raw);
             return null;
         }
     }
@@ -1885,13 +3275,14 @@ private void pushConfigNowValidated()
 
         uiSetPanelStatus("Pinging device...");
 
+        log.info("AUTO CAT probe URL: {}", url);
         Request req = new Request.Builder().url(url).get().build();
         http.newCall(req).enqueue(new Callback()
         {
             @Override
             public void onFailure(Call call, IOException ex)
             {
-                log.debug("ESP32 ping failed: {}", ex.toString());
+                log.info("ESP32 ping failed: {}", ex.toString());
                 uiSetPanelStatus("Ping failed.");
             }
 
@@ -1900,7 +3291,7 @@ private void pushConfigNowValidated()
             {
                 try (Response r = resp)
                 {
-                    log.debug("ESP32 ping HTTP {}", r.code());
+                    log.info("ESP32 ping HTTP {}", r.code());
 
                     if (r.isSuccessful())
                     {
@@ -2256,6 +3647,7 @@ private void testToast99AndMulti(int n)
         inFlightKind = nextKind;
         inFlightPayload = p;
 
+        log.info("SEND START kind={}", nextKind);
         postAsync(url, p);
     }
 
@@ -2263,11 +3655,11 @@ private void testToast99AndMulti(int n)
     {
         if (pending.containsKey(PendingKind.CONFIG)) return PendingKind.CONFIG;
         if (pending.containsKey(PendingKind.TOAST)) return PendingKind.TOAST;
+        if (pending.containsKey(PendingKind.SNAPSHOT)) return PendingKind.SNAPSHOT;
         if (pending.containsKey(PendingKind.LEVEL)) return PendingKind.LEVEL;
         if (pending.containsKey(PendingKind.BANK))  return PendingKind.BANK;
         if (pending.containsKey(PendingKind.XP))    return PendingKind.XP;
         if (pending.containsKey(PendingKind.HEARTBEAT)) return PendingKind.HEARTBEAT;
-        if (pending.containsKey(PendingKind.SNAPSHOT)) return PendingKind.SNAPSHOT;
         return null;
     }
 
@@ -2312,6 +3704,8 @@ private void testToast99AndMulti(int n)
 
             if (ok)
             {
+                log.info("SEND OK kind={} httpCode={}", sentKind, httpCode);
+
                 PushPayload stillPending = pending.get(sentKind);
                 if (stillPending == sentPayload)
                 {
@@ -2346,7 +3740,7 @@ private void testToast99AndMulti(int n)
                 consecutiveFailures = 0;
                 backoffMs = RETRY_BACKOFF_BASE_MS;
 
-                log.debug("ESP32 push rejected with HTTP 403 for {}. Dropping without retry.", sentKind);
+                log.info("ESP32 push rejected with HTTP 403 for {}. Dropping without retry.", sentKind);
 
                 sendNextLocked();
                 return;
@@ -2355,11 +3749,11 @@ private void testToast99AndMulti(int n)
             consecutiveFailures++;
             if (httpCode != 0)
             {
-                log.debug("ESP32 push failed HTTP {}", httpCode);
+                log.info("ESP32 push failed HTTP {}", httpCode);
             }
             else if (err != null)
             {
-                log.debug("ESP32 push failed: {}", err);
+                log.info("ESP32 push failed: {}", err);
             }
 
             backoffMs = Math.min(backoffMs * 2, RETRY_BACKOFF_MAX_MS);
